@@ -21,6 +21,10 @@ pub mod project {
     pub struct SynthParams {
         pub waveform: Waveform,
         pub adsr: AdsrEnvelope,
+        pub unison_count: u32,
+        pub unison_detune: f32,
+        pub unison_blend: f32,
+        pub octave_offset: i32,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]

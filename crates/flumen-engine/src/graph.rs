@@ -12,6 +12,9 @@ pub trait AudioNode: Send + std::any::Any {
         self.trigger(); // Default fallback
     }
     fn release(&mut self) { }
+    fn release_freq(&mut self, _freq: f32) {
+        self.release(); // Default fallback
+    }
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
@@ -82,9 +85,10 @@ impl From<AdsrEnvelope> for flumen_common::project::AdsrEnvelope {
     }
 }
 
-pub struct MultiWaveSynth {
+pub struct SynthVoice {
     pub waveform: Waveform,
     pub frequency: f32,
+    pub base_frequency: f32,
     pub detune: f32, // in cents or multiplier
     pub adsr: AdsrEnvelope,
     pub envelope_val: f32,
@@ -96,11 +100,12 @@ pub struct MultiWaveSynth {
     releasing: bool,
 }
 
-impl MultiWaveSynth {
+impl SynthVoice {
     pub fn new(freq: f32, waveform: Waveform) -> Self {
         Self {
             waveform,
             frequency: freq,
+            base_frequency: freq,
             detune: 0.0,
             adsr: AdsrEnvelope::default(),
             phase: 0.0,
@@ -127,7 +132,7 @@ impl MultiWaveSynth {
     }
 }
 
-impl AudioNode for MultiWaveSynth {
+impl AudioNode for SynthVoice {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -192,7 +197,7 @@ impl AudioNode for MultiWaveSynth {
     }
 }
 
-impl From<flumen_common::project::SynthParams> for MultiWaveSynth {
+impl From<flumen_common::project::SynthParams> for SynthVoice {
     fn from(p: flumen_common::project::SynthParams) -> Self {
         let mut s = Self::new(440.0, p.waveform.into());
         s.adsr = p.adsr.into();
@@ -200,11 +205,124 @@ impl From<flumen_common::project::SynthParams> for MultiWaveSynth {
     }
 }
 
-impl From<&MultiWaveSynth> for flumen_common::project::SynthParams {
-    fn from(s: &MultiWaveSynth) -> Self {
+impl From<&SynthVoice> for flumen_common::project::SynthParams {
+    fn from(s: &SynthVoice) -> Self {
         Self {
             waveform: s.waveform.into(),
             adsr: flumen_common::project::AdsrEnvelope::from(s.adsr),
+            unison_count: 1,
+            unison_detune: 0.1,
+            unison_blend: 0.5,
+            octave_offset: 0,
+        }
+    }
+}
+
+pub struct PolySynth {
+    pub voices: Vec<SynthVoice>,
+    pub waveform: Waveform,
+    pub adsr: AdsrEnvelope,
+    pub unison_count: u32,
+    pub unison_detune: f32,
+    pub unison_blend: f32,
+    pub octave_offset: i32,
+}
+
+impl PolySynth {
+    pub fn new(waveform: Waveform) -> Self {
+        let mut voices = Vec::new();
+        for _ in 0..64 {
+            voices.push(SynthVoice::new(440.0, waveform));
+        }
+        Self {
+            voices,
+            waveform,
+            adsr: AdsrEnvelope::default(),
+            unison_count: 1,
+            unison_detune: 0.1,
+            unison_blend: 0.5,
+            octave_offset: 0,
+        }
+    }
+
+    pub fn set_waveform(&mut self, waveform: Waveform) {
+        self.waveform = waveform;
+        for v in &mut self.voices {
+            v.waveform = waveform;
+        }
+    }
+
+    pub fn set_adsr(&mut self, adsr: AdsrEnvelope) {
+        self.adsr = adsr;
+        for v in &mut self.voices {
+            v.adsr = adsr;
+        }
+    }
+}
+
+impl AudioNode for PolySynth {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
+    fn trigger_freq(&mut self, freq: f32) {
+        let octave_multiplier = 2.0_f32.powi(self.octave_offset);
+        let base_f = freq * octave_multiplier;
+
+        let u_count = self.unison_count.max(1).min(7);
+        
+        for i in 0..u_count {
+            // Detune formula: map i to range [-spread, +spread]
+            let spread = if u_count > 1 {
+                (i as f32 / (u_count - 1) as f32 - 0.5) * 2.0 * self.unison_detune
+            } else {
+                0.0
+            };
+            
+            // freq * 2^(cents/1200) -> for simplicity using frequency ratio spread
+            let detuned_f = base_f * (1.0 + spread * 0.05); // 5% max spread roughly
+
+            if let Some(voice) = self.voices.iter_mut().find(|v| !v.is_triggered) {
+                voice.frequency = detuned_f;
+                voice.base_frequency = freq; // store the original trigger freq for release
+                voice.trigger();
+            }
+        }
+    }
+
+    fn release_freq(&mut self, freq: f32) {
+        for v in &mut self.voices {
+            // Check if base frequency matches the one we want to release
+            if v.is_triggered && (v.base_frequency - freq).abs() < 0.1 {
+                v.release();
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        for v in &mut self.voices {
+            v.release();
+        }
+    }
+
+    fn process(&mut self, outputs: &mut [&mut [f32]], context: &ProcessContext) {
+        let n = outputs[0].len();
+        let mut temp_buf = vec![0.0; n];
+        
+        for v in &mut self.voices {
+            if v.is_triggered || v.releasing {
+                for s in &mut temp_buf { *s = 0.0; }
+                let mut temp_ptr = [&mut temp_buf[..]];
+                v.process(&mut temp_ptr, context);
+                
+                // Unison Blend logic: scale volume of detuned voices
+                let octave_multiplier = 2.0_f32.powi(self.octave_offset);
+                let is_center = (v.frequency - v.base_frequency * octave_multiplier).abs() < 0.1;
+                let vol = if is_center { 1.0 } else { self.unison_blend };
+
+                for (out_sample, voice_sample) in outputs[0].iter_mut().zip(temp_buf.iter()) {
+                    *out_sample += *voice_sample * vol;
+                }
+            }
         }
     }
 }
@@ -474,13 +592,33 @@ impl AudioGraph {
     pub fn save_project(&self, name: String) -> flumen_common::project::Project {
         let mut tracks = Vec::new();
         for (i, track) in self.engine.tracks.iter().enumerate() {
-            let synth = if let Some(s) = track.node.as_any().downcast_ref::<MultiWaveSynth>() {
-                 flumen_common::project::SynthParams::from(s)
+            let synth = if let Some(s) = track.node.as_any().downcast_ref::<PolySynth>() {
+                 flumen_common::project::SynthParams {
+                    waveform: s.waveform.into(),
+                    adsr: flumen_common::project::AdsrEnvelope::from(s.adsr),
+                    unison_count: s.unison_count,
+                    unison_detune: s.unison_detune,
+                    unison_blend: s.unison_blend,
+                    octave_offset: s.octave_offset,
+                 }
+            } else if let Some(s) = track.node.as_any().downcast_ref::<SynthVoice>() {
+                 flumen_common::project::SynthParams {
+                     waveform: s.waveform.into(),
+                     adsr: flumen_common::project::AdsrEnvelope::from(s.adsr),
+                     unison_count: 1,
+                     unison_detune: 0.1,
+                     unison_blend: 0.5,
+                     octave_offset: 0,
+                 }
             } else {
-                // Fallback or default if not MultiWaveSynth
+                // Fallback or default if not PolySynth
                 flumen_common::project::SynthParams {
                     waveform: flumen_common::project::Waveform::Sine,
                     adsr: flumen_common::project::AdsrEnvelope { attack: 0.01, decay: 0.1, sustain: 0.5, release: 0.2 },
+                    unison_count: 1,
+                    unison_detune: 0.1,
+                    unison_blend: 0.5,
+                    octave_offset: 0,
                 }
             };
 
@@ -520,13 +658,20 @@ impl AudioGraph {
         self.engine.active_notes.clear();
         
         for t in proj.tracks {
-            let track = EngineTrack {
-                node: Box::new(MultiWaveSynth::from(t.synth)),
+            let mut track = EngineTrack {
+                node: Box::new(PolySynth::new(t.synth.waveform.into())),
                 patterns: t.patterns.into_iter().map(|p| p.into()).collect(),
                 current_pattern_idx: 0,
                 volume: t.volume,
                 pan: t.panned,
             };
+            if let Some(poly) = track.node.as_any_mut().downcast_mut::<PolySynth>() {
+                poly.set_adsr(t.synth.adsr.into());
+                poly.unison_count = t.synth.unison_count;
+                poly.unison_detune = t.synth.unison_detune;
+                poly.unison_blend = t.synth.unison_blend;
+                poly.octave_offset = t.synth.octave_offset;
+            }
             self.engine.tracks.push(track);
         }
 

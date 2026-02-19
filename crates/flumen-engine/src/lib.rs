@@ -1,7 +1,7 @@
 pub mod graph;
 
 pub mod engine {
-    use crate::graph::{AudioGraph, ProcessContext, MultiWaveSynth, Waveform};
+    use crate::graph::{AudioGraph, ProcessContext, PolySynth, Waveform};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::sync::{Arc, Mutex};
 
@@ -16,7 +16,7 @@ pub mod engine {
             let mut graph = AudioGraph::new();
             
             // Track 1: Bass (Saw)
-            graph.engine.add_track(Box::new(MultiWaveSynth::new(55.0, Waveform::Saw)));
+            graph.engine.add_track(Box::new(PolySynth::new(Waveform::Saw)));
             {
                 let pattern = graph.engine.tracks[0].current_pattern_mut();
                 // A simple melodic bassline
@@ -27,7 +27,7 @@ pub mod engine {
             }
 
             // Track 2: Lead (Square)
-            graph.engine.add_track(Box::new(MultiWaveSynth::new(220.0, Waveform::Square)));
+            graph.engine.add_track(Box::new(PolySynth::new(Waveform::Square)));
             {
                 let pattern = graph.engine.tracks[1].current_pattern_mut();
                 // A simple melody

@@ -28,6 +28,7 @@ pub struct State {
     pub favus_scroll: egui::Vec2,
     pub active_item_idx: Option<usize>, // item being dragged or resized
     pub is_resizing: bool,
+    pub mouse_played_note: Option<f32>,
 }
 
 impl State {
@@ -125,6 +126,7 @@ impl State {
             favus_scroll: egui::Vec2::ZERO,
             active_item_idx: None,
             is_resizing: false,
+            mouse_played_note: None,
         }
     }
 
@@ -137,15 +139,29 @@ impl State {
         }
     }
 
-    fn custom_knob(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, label: &str) {
+    fn custom_knob(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, label: &str) -> bool {
+        let mut changed = false;
         ui.vertical(|ui| {
             ui.set_max_width(45.0);
             let knob_size = egui::vec2(40.0, 40.0);
-            let (rect, response) = ui.allocate_exact_size(knob_size, egui::Sense::drag());
+            
+            // Use a unique ID for this knob's state
+            let id = ui.make_persistent_id(label);
+            
+            // Get or store the current 'smooth' value for dragging
+            let mut smooth_val = ui.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || *value));
+
+            let (rect, response) = ui.allocate_exact_size(knob_size, egui::Sense::click_and_drag());
 
             if response.dragged() {
                 let delta = response.drag_delta().y * -0.01;
-                *value = (*value + delta).clamp(*range.start(), *range.end());
+                smooth_val = (smooth_val + delta).clamp(*range.start(), *range.end());
+                ui.data_mut(|d| d.insert_temp(id, smooth_val));
+                *value = smooth_val;
+                changed = true;
+            } else if !response.hovered() && !response.dragged() {
+                // Keep smooth_val in sync with external changes when not interacting
+                ui.data_mut(|d| d.insert_temp(id, *value));
             }
 
             let visuals = ui.style().interact(&response);
@@ -167,10 +183,9 @@ impl State {
             painter.line_segment([rect.center(), pointer_pos], egui::Stroke::new(2.5, egui::Color32::from_rgb(0, 255, 150)));
 
             ui.add_space(2.0);
-            ui.centered_and_justified(|ui| {
-                ui.label(egui::RichText::new(label).size(9.0).color(egui::Color32::GRAY));
-            });
+            ui.label(egui::RichText::new(label).size(8.0).color(egui::Color32::GRAY));
         });
+        changed
     }
 
     fn waveform_selector(ui: &mut egui::Ui, current: &mut flumen_engine::graph::Waveform) {
@@ -251,7 +266,7 @@ impl State {
                         if ui.button("New Project").clicked() {
                             graph.engine.tracks.clear();
                             graph.engine.tracks.push(flumen_engine::graph::EngineTrack {
-                                node: Box::new(flumen_engine::graph::MultiWaveSynth::new(440.0, flumen_engine::graph::Waveform::Sine)),
+                                node: Box::new(flumen_engine::graph::PolySynth::new(flumen_engine::graph::Waveform::Sine)),
                                 patterns: vec![flumen_engine::graph::Pattern::default()],
                                 current_pattern_idx: 0,
                                 volume: 0.7,
@@ -423,7 +438,7 @@ impl State {
                     
                     if let Some(idx) = self.selected_track {
                         if let Some(track) = graph.engine.tracks.get_mut(idx) {
-                            if let Some(synth) = track.node.as_any_mut().downcast_mut::<flumen_engine::graph::MultiWaveSynth>() {
+                            if let Some(synth) = track.node.as_any_mut().downcast_mut::<flumen_engine::graph::PolySynth>() {
                                 ui.heading(format!("Track {:02} Parameters", idx+1));
                                 ui.add_space(10.0);
 
@@ -453,21 +468,59 @@ impl State {
                                     }
                                 });
                                 
-                                ui.add_space(10.0);
-                                
-                                ui.group(|ui| {
-                                    ui.label("Oscillator:");
-                                    Self::waveform_selector(ui, &mut synth.waveform);
+                                // Waveform Selector and Octave (Knobs)
+                                ui.horizontal(|ui| {
+                                    let mut waveform_idx = match synth.waveform {
+                                        flumen_engine::graph::Waveform::Sine => 0.0,
+                                        flumen_engine::graph::Waveform::Saw => 1.0,
+                                        flumen_engine::graph::Waveform::Square => 2.0,
+                                        flumen_engine::graph::Waveform::Triangle => 3.0,
+                                    };
+                                    if Self::custom_knob(ui, &mut waveform_idx, 0.0..=3.0, "OSC") {
+                                        synth.set_waveform(match waveform_idx.round() as i32 {
+                                            0 => flumen_engine::graph::Waveform::Sine,
+                                            1 => flumen_engine::graph::Waveform::Saw,
+                                            2 => flumen_engine::graph::Waveform::Square,
+                                            _ => flumen_engine::graph::Waveform::Triangle,
+                                        });
+                                    }
+                                    
+                                    ui.add_space(8.0);
+                                    let mut oct = synth.octave_offset as f32;
+                                    if Self::custom_knob(ui, &mut oct, -3.0..=3.0, "OCT") {
+                                        synth.octave_offset = oct.round() as i32;
+                                    }
+
+                                    ui.add_space(15.0);
+                                    
+                                    // Unison Controls
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            let mut u_count = synth.unison_count as f32;
+                                            if Self::custom_knob(ui, &mut u_count, 1.0..=7.0, "UNISON") {
+                                                synth.unison_count = u_count.round() as u32;
+                                            }
+
+                                            ui.add_space(5.0);
+                                            Self::custom_knob(ui, &mut synth.unison_detune, 0.0..=1.0, "DETUNE");
+                                            ui.add_space(5.0);
+                                            Self::custom_knob(ui, &mut synth.unison_blend, 0.0..=1.0, "BLEND");
+                                        });
+                                    });
                                 });
                                 
-                                ui.add_space(10.0);
+                                ui.add_space(8.0);
                                 ui.group(|ui| {
                                     ui.label("ADSR Envelope:");
                                     ui.horizontal_wrapped(|ui| {
-                                        Self::custom_knob(ui, &mut synth.adsr.attack, 0.001..=1.0, "ATK");
-                                        Self::custom_knob(ui, &mut synth.adsr.decay, 0.001..=1.0, "DEC");
-                                        Self::custom_knob(ui, &mut synth.adsr.sustain, 0.0..=1.0, "SUS");
-                                        Self::custom_knob(ui, &mut synth.adsr.release, 0.001..=2.0, "REL");
+                                        let mut adsr = synth.adsr;
+                                        Self::custom_knob(ui, &mut adsr.attack, 0.001..=1.0, "ATK");
+                                        Self::custom_knob(ui, &mut adsr.decay, 0.001..=1.0, "DEC");
+                                        Self::custom_knob(ui, &mut adsr.sustain, 0.0..=1.0, "SUS");
+                                        Self::custom_knob(ui, &mut adsr.release, 0.001..=2.0, "REL");
+                                        if adsr != synth.adsr {
+                                            synth.set_adsr(adsr);
+                                        }
                                     });
                                 });
                             }
@@ -509,7 +562,7 @@ impl State {
                                 painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
 
                                 let track_h = 40.0;
-                                let step_w = 10.0; // zoom_x for favus is different or fixed
+                                let _step_w = 10.0; // zoom_x for favus is different or fixed
                                 let favus_zoom_x = 10.0;
 
                                 // --- Interaction Logic for Favus ---
@@ -522,7 +575,7 @@ impl State {
                                         let rel_x = pos.x - rect.min.x;
                                         let rel_y = pos.y - rect.min.y;
                                         let step_idx = (rel_x / favus_zoom_x + self.favus_scroll.x) as u32;
-                                        let track_idx = (rel_y / track_h + self.favus_scroll.y) as usize;
+                                        let _track_idx = (rel_y / track_h + self.favus_scroll.y) as usize;
 
                                         if ui.input(|i| i.pointer.primary_clicked()) {
                                             // Place new pattern if not clicking an existing one
@@ -635,7 +688,9 @@ impl State {
                                     }
                                     self.pr_scroll.x -= scroll_delta.x / zoom_x;
 
-                                    if response.dragged() {
+                                    self.pr_scroll.x -= scroll_delta.x / zoom_x;
+
+                                    if response.dragged_by(egui::PointerButton::Middle) {
                                         let delta = response.drag_delta();
                                         self.pr_scroll.x -= delta.x / zoom_x;
                                         self.pr_scroll.y -= delta.y / zoom_y;
@@ -645,14 +700,31 @@ impl State {
                                     if let Some(pos) = response.interact_pointer_pos() {
                                         let piano_key_width_ratio = 0.06;
                                         let grid_x_start = rect.min.x + rect.width() * piano_key_width_ratio;
-                                        if pos.x > grid_x_start {
-                                            let x_idx = ((pos.x - grid_x_start) / zoom_x + self.pr_scroll.x) as i32;
-                                            let y_idx = ((pos.y - rect.min.y) / zoom_y + self.pr_scroll.y) as i32;
-                                            let pitch_idx = (120 - 1 - y_idx) as i32;
+                                        
+                                        let y_idx = ((pos.y - rect.min.y) / zoom_y + self.pr_scroll.y) as i32;
+                                        let pitch_idx = (120 - 1 - y_idx) as i32;
+                                        let midi = 12 + pitch_idx;
+                                        let freq = 440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0);
 
-                                            if x_idx >= 0 && x_idx < 128 && pitch_idx >= 0 && pitch_idx < 120 {
-                                                if let Some(track_idx) = self.selected_track {
-                                                    if let Some(track) = graph.engine.tracks.get_mut(track_idx) {
+                                        if let Some(track_idx) = self.selected_track {
+                                            if let Some(track) = graph.engine.tracks.get_mut(track_idx) {
+                                                if ui.input(|i| i.pointer.primary_down()) {
+                                                    if pos.x <= grid_x_start || ui.input(|i| i.pointer.primary_clicked()) {
+                                                        // If we moved to a new note while dragging, or just clicked
+                                                        if self.mouse_played_note != Some(freq) {
+                                                            if let Some(old_f) = self.mouse_played_note {
+                                                                track.node.release_freq(old_f);
+                                                            }
+                                                            track.node.trigger_freq(freq);
+                                                            self.mouse_played_note = Some(freq);
+                                                        }
+                                                    }
+                                                }
+
+                                                if pos.x > grid_x_start {
+                                                    // Grid edit logic (placing/removing notes)
+                                                    let x_idx = ((pos.x - grid_x_start) / zoom_x + self.pr_scroll.x) as i32;
+                                                    if x_idx >= 0 && x_idx < 128 && pitch_idx >= 0 && pitch_idx < 120 {
                                                         if ui.input(|i| i.pointer.primary_clicked()) && response.clicked() {
                                                             track.current_pattern_mut().grid[pitch_idx as usize][x_idx as usize] = 1;
                                                         } else if ui.input(|i| i.pointer.secondary_clicked()) && response.secondary_clicked() {
@@ -661,6 +733,18 @@ impl State {
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+
+                                    // Global release handling for mouse played notes
+                                    if ui.input(|i| i.pointer.primary_released()) {
+                                        if let Some(freq) = self.mouse_played_note {
+                                            if let Some(track_idx) = self.selected_track {
+                                                if let Some(track) = graph.engine.tracks.get_mut(track_idx) {
+                                                    track.node.release_freq(freq);
+                                                }
+                                            }
+                                            self.mouse_played_note = None;
                                         }
                                     }
                                 }
