@@ -1,0 +1,19 @@
+[package]
+name = "flumen-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flumen-common = { path = "../flumen-common" }
+flumen-engine = { path = "../flumen-engine" }
+wgpu = { workspace = true }
+winit = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+tokio = { workspace = true }
+pollster = { workspace = true }
+serde_json = { workspace = true }
+bytemuck = { version = "1.16", features = ["derive"] }
+egui = "0.31"
+egui-winit = "0.31"
+egui-wgpu = "0.31"

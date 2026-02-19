@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flumen-engine",
+    "crates/flumen-gui",
+    "crates/flumen-common",
+]
+
+[workspace.dependencies]
+wgpu = "24.0.5"
+winit = "0.30.12"
+cpal = "0.15.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1.0", features = ["full"] }
+flatbuffers = "24.3.25"
+rusqlite = "0.32.1"
+clap-sys = "0.4" # Standard CLAP bindings
+pollster = "0.3"

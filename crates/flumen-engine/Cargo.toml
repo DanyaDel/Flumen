@@ -1,0 +1,9 @@
+[package]
+name = "flumen-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flumen-common = { path = "../flumen-common" }
+cpal = { workspace = true }
+log = { workspace = true }
