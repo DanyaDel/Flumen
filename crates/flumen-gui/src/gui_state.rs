@@ -655,7 +655,7 @@ impl State {
                                         let rel_x = pos.x - rect.min.x;
                                         let rel_y = pos.y - rect.min.y;
                                         let step_idx = (rel_x / favus_zoom_x + self.favus_scroll.x) as u32;
-                                        let _track_idx = (rel_y / track_h + self.favus_scroll.y) as usize;
+                                        let track_idx = (rel_y / track_h + self.favus_scroll.y).max(0.0) as usize;
 
                                         if ui.input(|i| i.pointer.primary_clicked()) {
                                             // Place new pattern if not clicking an existing one
@@ -676,14 +676,23 @@ impl State {
                                             }
 
                                             if !hit {
-                                                if let Some(t_idx) = self.selected_track {
-                                                    graph.engine.playlist.push(flumen_engine::graph::ArrangementItem {
-                                                        track_id: t_idx as u32,
-                                                        pattern_index: 0,
-                                                        start_step: step_idx,
-                                                        length: 16,
+                                                // Create tracks automatically if clicking on an empty row
+                                                while track_idx >= graph.engine.tracks.len() {
+                                                    graph.engine.tracks.push(flumen_engine::graph::EngineTrack {
+                                                        node: Box::new(flumen_engine::graph::PolySynth::new(flumen_engine::graph::Waveform::Saw)),
+                                                        patterns: vec![flumen_engine::graph::Pattern::default()],
+                                                        current_pattern_idx: 0,
+                                                        volume: 0.8,
+                                                        pan: 0.0,
                                                     });
                                                 }
+                                                
+                                                graph.engine.playlist.push(flumen_engine::graph::ArrangementItem {
+                                                    track_id: track_idx as u32,
+                                                    pattern_index: 0,
+                                                    start_step: step_idx,
+                                                    length: 16,
+                                                });
                                             }
                                         }
                                     }
