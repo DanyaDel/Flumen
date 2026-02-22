@@ -24,6 +24,14 @@ pub struct State {
     pub is_omnia_open: bool,
     // Piano Roll View state
     pub pr_scroll: egui::Vec2, // in steps/notes
+    pub pr_selection: Option<(egui::Vec2, egui::Vec2)>, // start and end of selection
+    pub pr_selected_notes: Vec<(usize, usize)>, // selected notes (pitch, step)
+    pub pr_draw_mode: Option<bool>, // true = draw, false = erase
+    pub pr_note_length: u8, // default note length in steps
+    pub pr_last_clicked_note: Option<(usize, usize)>, // for drag detection
+    pub pr_is_dragging: bool,
+    pub pr_hover_note: Option<(usize, usize, f32)>, // pitch, step, offset_in_note
+    pub pr_resize_mode: bool,
     // Favus state
     pub favus_scroll: egui::Vec2,
     pub active_item_idx: Option<usize>, // item being dragged or resized
@@ -123,6 +131,14 @@ impl State {
             is_fluctus_open: false,
             is_omnia_open: false,
             pr_scroll: egui::Vec2::ZERO,
+            pr_selection: None,
+            pr_selected_notes: Vec::new(),
+            pr_draw_mode: None,
+            pr_note_length: 4,
+            pr_last_clicked_note: None,
+            pr_is_dragging: false,
+            pr_hover_note: None,
+            pr_resize_mode: false,
             favus_scroll: egui::Vec2::ZERO,
             active_item_idx: None,
             is_resizing: false,
@@ -142,48 +158,47 @@ impl State {
     fn custom_knob(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, label: &str) -> bool {
         let mut changed = false;
         ui.vertical(|ui| {
-            ui.set_max_width(45.0);
-            let knob_size = egui::vec2(40.0, 40.0);
-            
-            // Use a unique ID for this knob's state
+            ui.set_max_width(50.0);
+            let knob_size = egui::vec2(38.0, 38.0);
             let id = ui.make_persistent_id(label);
-            
-            // Get or store the current 'smooth' value for dragging
             let mut smooth_val = ui.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || *value));
 
             let (rect, response) = ui.allocate_exact_size(knob_size, egui::Sense::click_and_drag());
 
             if response.dragged() {
-                let delta = response.drag_delta().y * -0.01;
+                let delta = response.drag_delta().y * -0.005;
                 smooth_val = (smooth_val + delta).clamp(*range.start(), *range.end());
                 ui.data_mut(|d| d.insert_temp(id, smooth_val));
                 *value = smooth_val;
                 changed = true;
             } else if !response.hovered() && !response.dragged() {
-                // Keep smooth_val in sync with external changes when not interacting
                 ui.data_mut(|d| d.insert_temp(id, *value));
             }
 
-            let visuals = ui.style().interact(&response);
             let painter = ui.painter();
+            let circle_color = if response.hovered() || response.dragged() { egui::Color32::from_rgb(60, 60, 70) } else { egui::Color32::from_rgb(40, 40, 45) };
             
-            // Outer circle
-            painter.circle_filled(rect.center(), rect.width() / 2.0, egui::Color32::from_rgb(35, 35, 40));
-            painter.circle_stroke(rect.center(), rect.width() / 2.0, egui::Stroke::new(1.0, visuals.bg_fill));
+            painter.circle_filled(rect.center(), rect.width() / 2.0, circle_color);
+            painter.circle_stroke(rect.center(), rect.width() / 2.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
 
-            // Tick marks (simplified)
             let t = (*value - *range.start()) / (*range.end() - *range.start());
-            let start_angle = std::f32::consts::PI * 0.75;
-            let end_angle = std::f32::consts::PI * 2.25;
+            let start_angle = 0.75 * std::f32::consts::PI;
+            let end_angle = 2.25 * std::f32::consts::PI;
             let angle = start_angle + t * (end_angle - start_angle);
 
-            // Pointer
-            let pointer_len = rect.width() / 2.0 - 2.0;
-            let pointer_pos = rect.center() + egui::vec2(angle.cos(), angle.sin()) * pointer_len;
-            painter.line_segment([rect.center(), pointer_pos], egui::Stroke::new(2.5, egui::Color32::from_rgb(0, 255, 150)));
+            let radius = rect.width() / 2.0 - 3.0;
+            let mut points = Vec::new();
+            for i in 0..=30 {
+                let a = start_angle + (i as f32 / 30.0) * (angle - start_angle);
+                points.push(rect.center() + egui::vec2(a.cos(), a.sin()) * radius);
+            }
+            painter.add(egui::Shape::line(points, egui::Stroke::new(3.0, egui::Color32::from_rgb(0, 200, 255))));
+
+            let p_pos = rect.center() + egui::vec2(angle.cos(), angle.sin()) * radius;
+            painter.line_segment([rect.center(), p_pos], egui::Stroke::new(1.5, egui::Color32::WHITE));
 
             ui.add_space(2.0);
-            ui.label(egui::RichText::new(label).size(8.0).color(egui::Color32::GRAY));
+            ui.label(egui::RichText::new(label).size(9.0).color(egui::Color32::from_gray(180)).strong());
         });
         changed
     }
@@ -197,7 +212,11 @@ impl State {
                 (flumen_engine::graph::Waveform::Triangle, "△"),
             ];
             for (w, icon) in waves {
-                if ui.selectable_label(*current == w, icon).clicked() {
+                let is_sel = *current == w;
+                let btn = egui::Button::new(egui::RichText::new(icon).size(14.0))
+                    .frame(false)
+                    .fill(if is_sel { egui::Color32::from_rgba_unmultiplied(0, 200, 255, 100) } else { egui::Color32::TRANSPARENT });
+                if ui.add(btn).clicked() {
                     *current = w;
                 }
             }
@@ -252,6 +271,15 @@ impl State {
         // --- 1. egui UI frame start ---
         let raw_input = self.egui_state.take_egui_input(&self.window);
         self.egui_ctx.begin_pass(raw_input);
+        
+        // --- Premium Styling ---
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_rgb(15, 15, 18);
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 20, 25);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 30, 35);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 150, 255);
+        self.egui_ctx.set_visuals(visuals);
+
         self.egui_ctx.request_repaint();
 
         let mut central_rect = egui::Rect::NOTHING;
@@ -259,10 +287,11 @@ impl State {
         {
             let mut graph = audio_engine.graph.lock().unwrap();
             
-            // --- 0. Top Menu Bar ---
-            egui::TopBottomPanel::top("menu_bar").show(&self.egui_ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
-                    ui.menu_button("File", |ui| {
+            // --- TOP PANEL: Main Toolbar ---
+            egui::TopBottomPanel::top("main_toolbar").exact_height(35.0).show(&self.egui_ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    // 1. Menu Section
+                    ui.menu_button(egui::RichText::new("☰ FLUMEN").strong().color(egui::Color32::from_rgb(0, 200, 255)), |ui| {
                         if ui.button("New Project").clicked() {
                             graph.engine.tracks.clear();
                             graph.engine.tracks.push(flumen_engine::graph::EngineTrack {
@@ -289,93 +318,142 @@ impl State {
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("Exit").clicked() { /* Exit handled by window close button for now */ ui.close_menu(); }
-                    });
-                    ui.menu_button("Edit", |ui| {
-                        if ui.button("Undo").clicked() { ui.close_menu(); }
-                    });
-                    ui.menu_button("View", |ui| {
-                        ui.checkbox(&mut self.is_favus_open, "Favus (Arrangement)");
-                        ui.checkbox(&mut self.is_piano_roll_open, "Piano Roll");
-                        ui.checkbox(&mut self.is_omnia_open, "Omnia FX");
-                        ui.checkbox(&mut self.is_fluctus_open, "Fluctus Synth");
-                    });
-                    ui.menu_button("Plugins", |ui| {
-                        if ui.button("Fluctus (Synth)").clicked() { 
-                            self.is_fluctus_open = true;
-                            ui.close_menu(); 
-                        }
-                    });
-                });
-            });
-
-            // --- 1. Transport Bar ---
-            egui::TopBottomPanel::top("transport_top").show(&self.egui_ctx, |ui| {
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    ui.visuals_mut().button_frame = true;
-                    
-                    let play_text = if graph.engine.is_playing { "⏸ PAUSE" } else { "▶ PLAY" };
-                    let btn_color = if graph.engine.is_playing { egui::Color32::from_rgb(180, 40, 40) } else { egui::Color32::from_rgb(40, 150, 40) };
-                    
-                    if ui.add_sized([80.0, 26.0], egui::Button::new(egui::RichText::new(play_text).strong()).fill(btn_color)).clicked() {
-                        graph.engine.is_playing = !graph.engine.is_playing;
-                    }
-
-                    ui.separator();
-                    
-                    if ui.button("🎹 Piano Roll").clicked() {
-                        self.is_piano_roll_open = !self.is_piano_roll_open;
-                    }
-                    if ui.button("🌀 Omnia FX").clicked() {
-                        self.is_omnia_open = !self.is_omnia_open;
-                    }
-                    if ui.button("🔌 Fluctus Synth").clicked() {
-                        if !self.is_fluctus_open && self.selected_track.is_none() {
-                            self.selected_track = Some(0);
-                        }
-                        self.is_fluctus_open = !self.is_fluctus_open;
-                    }
-
-                    ui.separator();
-                    ui.label(egui::RichText::new("BPM:").strong());
-                    ui.add(egui::DragValue::new(&mut graph.engine.bpm).range(20.0..=300.0).speed(1.0));
-                    
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!("STEP: {}", graph.engine.current_step + 1));
-                    });
-                });
-                ui.add_space(2.0);
-            });
-
-            // Mixer (Left)
-            egui::SidePanel::left("mixer_left").resizable(false).exact_width(180.0).show(&self.egui_ctx, |ui| {
-                ui.add_space(10.0);
-                ui.heading("🎚 Mixer");
-                ui.separator();
-                ui.add_space(5.0);
-
-                for (idx, track) in graph.engine.tracks.iter_mut().enumerate() {
-                    ui.group(|ui| {
-                        ui.set_width(160.0);
-                        ui.horizontal(|ui| {
-                            let label = format!("TRK {:02}", idx + 1);
-                            if ui.selectable_label(self.selected_track == Some(idx), egui::RichText::new(label).strong()).clicked() {
-                                self.selected_track = if self.selected_track == Some(idx) { None } else { Some(idx) };
+                        if ui.button("📤 Export to WAV (30s)").clicked() {
+                            if let Err(e) = audio_engine.export_to_wav("export.wav", 30.0) {
+                                eprintln!("Export failed: {}", e);
+                            } else {
+                                println!("Export completed: export.wav");
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new(format!("{:.2}", track.volume)).size(10.0));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Exit").clicked() { ui.close_menu(); }
+                    });
+                    ui.separator();
+
+                    // 2. View Toggles
+                    let tg_color = |on| if on { egui::Color32::from_rgb(200, 255, 200) } else { egui::Color32::GRAY };
+                    if ui.selectable_label(self.is_favus_open, egui::RichText::new("🏁 Arr").color(tg_color(self.is_favus_open))).clicked() { self.is_favus_open = !self.is_favus_open; }
+                    if ui.selectable_label(self.is_piano_roll_open, egui::RichText::new("🎹 PR").color(tg_color(self.is_piano_roll_open))).clicked() { self.is_piano_roll_open = !self.is_piano_roll_open; }
+                    if ui.selectable_label(self.is_omnia_open, egui::RichText::new("🌀 FX").color(tg_color(self.is_omnia_open))).clicked() { self.is_omnia_open = !self.is_omnia_open; }
+                    if ui.selectable_label(self.is_fluctus_open, egui::RichText::new("🔌 Synth").color(tg_color(self.is_fluctus_open))).clicked() { 
+                        if !self.is_fluctus_open && self.selected_track.is_none() { self.selected_track = Some(0); }
+                        self.is_fluctus_open = !self.is_fluctus_open; 
+                    }
+                    
+                    ui.separator();
+                    
+                    // 3. Central Transport (Play/Stop with explicit colors)
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let center_offset = ui.available_width() / 2.0 - 60.0;
+                        if center_offset > 0.0 { ui.add_space(center_offset); }
+                        
+                        let is_playing = graph.engine.is_playing;
+                        if ui.add_sized([35.0, 26.0], egui::Button::new(egui::RichText::new("▶").size(16.0).color(if is_playing { egui::Color32::GREEN } else { egui::Color32::GRAY }))).clicked() {
+                            graph.engine.is_playing = true;
+                        }
+                        if ui.add_sized([35.0, 26.0], egui::Button::new(egui::RichText::new("⏸").size(16.0).color(if !is_playing { egui::Color32::RED } else { egui::Color32::GRAY }))).clicked() {
+                            graph.engine.is_playing = false;
+                        }
+                        if ui.add_sized([35.0, 26.0], egui::Button::new(egui::RichText::new("⏹").size(14.0).color(egui::Color32::GRAY))).clicked() {
+                            graph.engine.is_playing = false;
+                            graph.engine.current_step = 0;
+                        }
+                    });
+
+                    // 4. Time / BPM Information
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(10.0);
+                        // Digital style step counter
+                        let step_text = format!("{:03}.{:02}", graph.engine.current_step / 4 + 1, (graph.engine.current_step % 4) + 1);
+                        ui.label(egui::RichText::new(step_text).strong().monospace().size(18.0).color(egui::Color32::from_rgb(0, 255, 150)));
+                        ui.separator();
+                        
+                        let mut bpm = graph.engine.bpm;
+                        ui.add(egui::DragValue::new(&mut bpm).range(20.0..=300.0).speed(1.0).suffix(" BPM"));
+                        graph.engine.bpm = bpm;
+                    });
+                });
+            });
+
+            // Mixer / Track Overview (Left)
+            egui::SidePanel::left("mixer_left").resizable(true).min_width(200.0).max_width(320.0).show(&self.egui_ctx, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.heading(egui::RichText::new("🎚 MIXER").color(egui::Color32::from_rgb(200, 200, 200)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("+ Add").clicked() {
+                            graph.engine.tracks.push(flumen_engine::graph::EngineTrack {
+                                node: Box::new(flumen_engine::graph::PolySynth::new(flumen_engine::graph::Waveform::Saw)),
+                                patterns: vec![flumen_engine::graph::Pattern::default()],
+                                current_pattern_idx: 0,
+                                volume: 0.8,
+                                pan: 0.0,
+                            });
+                        }
+                    });
+                });
+                ui.separator();
+                
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(5.0);
+                    let mut track_to_remove = None;
+
+                    for (idx, track) in graph.engine.tracks.iter_mut().enumerate() {
+                        let is_selected = self.selected_track == Some(idx);
+                        
+                        let bg_color = if is_selected { 
+                            egui::Color32::from_rgb(30, 40, 50) 
+                        } else { 
+                            egui::Color32::from_rgb(20, 20, 25) 
+                        };
+
+                        let frame = egui::Frame::none()
+                            .fill(bg_color)
+                            .rounding(4.0)
+                            .inner_margin(8.0)
+                            .stroke(if is_selected { egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 150, 255)) } else { egui::Stroke::NONE });
+                        
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let label = format!("TRK {:02}", idx + 1);
+                                if ui.selectable_label(is_selected, egui::RichText::new(label).strong().color(if is_selected { egui::Color32::WHITE } else { egui::Color32::GRAY })).clicked() {
+                                    self.selected_track = if is_selected { None } else { Some(idx) };
+                                }
+                                
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("🗑").clicked() {
+                                        track_to_remove = Some(idx);
+                                    }
+                                    let mut is_synth_open = self.is_fluctus_open && self.selected_track == Some(idx);
+                                    if ui.toggle_value(&mut is_synth_open, "🔌").clicked() {
+                                        if is_synth_open { self.selected_track = Some(idx); }
+                                        self.is_fluctus_open = is_synth_open;
+                                    }
+                                });
+                            });
+                            
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                Self::custom_knob(ui, &mut track.volume, 0.0..=1.0, "VOL");
+                                ui.add_space(10.0);
+                                Self::custom_knob(ui, &mut track.pan, -1.0..=1.0, "PAN");
                             });
                         });
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            Self::custom_knob(ui, &mut track.volume, 0.0..=1.0, "VOL");
-                            ui.add_space(15.0);
-                            Self::custom_knob(ui, &mut track.pan, -1.0..=1.0, "PAN");
-                        });
-                    });
-                    ui.add_space(4.0);
-                }
+                    }
+                    
+                    if let Some(idx) = track_to_remove {
+                        graph.engine.tracks.remove(idx);
+                        if self.selected_track == Some(idx) {
+                            self.selected_track = None;
+                        } else if let Some(sel) = self.selected_track {
+                            if sel > idx {
+                                self.selected_track = Some(sel - 1);
+                            }
+                        }
+                    }
+                });
             });
 
             // --- 2. Floating Windows ---
@@ -660,130 +738,366 @@ impl State {
 
                     if show_piano {
                         ui.allocate_ui(egui::vec2(total_available.x, piano_h), |ui| {
-                            // --- Piano Roll View (Constrained to CentralPanel) ---
+                            // --- Piano Roll View ---
                             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
+                            // Minimalist Info Bar
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("🎹 PIANO_ROLL").strong().color(egui::Color32::from_rgb(0, 200, 255)));
+                                ui.separator();
+                                ui.label(format!("Length: {} steps", self.pr_note_length));
+                                ui.separator();
+                                ui.label(egui::RichText::new("Alt+Wheel: Note Size").size(10.0).color(egui::Color32::GRAY));
+                                ui.separator();
+                                ui.label(egui::RichText::new("Shift+Click: Select").size(10.0).color(egui::Color32::GRAY));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("🗑 Clear All").clicked() {
+                                        if let Some(track_idx) = self.selected_track {
+                                            if let Some(track) = graph.engine.tracks.get_mut(track_idx) {
+                                                track.current_pattern_mut().grid = [[0; 128]; 120];
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                            ui.separator();
+
                             let available = ui.available_size();
-                            let scroll_v_w = 16.0;
-                            let scroll_h_h = 24.0;
-                            let grid_w = available.x - scroll_v_w;
-                            let grid_h = available.y - scroll_h_h;
+                            let grid_w = available.x - 16.0;
+                            let grid_h = available.y - 24.0;
 
                             ui.horizontal(|ui| {
-                                // GRID AREA
                                 let (rect, response) = ui.allocate_exact_size(egui::vec2(grid_w, grid_h), egui::Sense::click_and_drag());
                                 self.central_panel_rect = rect;
                                 central_rect = rect;
 
                                 let zoom_x = 60.0;
                                 let zoom_y = 25.0;
+                                let piano_key_width_ratio = 0.06;
+                                let grid_x_start = rect.min.x + rect.width() * piano_key_width_ratio;
 
-                                // --- Interaction Logic (FIXED: Better egui handling to prevent leakage) ---
+                                // --- KEYBOARD SHORTCUTS ---
                                 if response.hovered() {
-                                    let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                    if ui.input(|i| i.modifiers.shift) {
-                                        self.pr_scroll.x -= scroll_delta.y / zoom_x;
-                                    } else {
-                                        self.pr_scroll.y -= scroll_delta.y / zoom_y;
+                                    if ui.input(|i| i.key_pressed(egui::Key::A) && i.modifiers.ctrl) {
+                                        if let Some(t_idx) = self.selected_track {
+                                            if let Some(track) = graph.engine.tracks.get(t_idx) {
+                                                self.pr_selected_notes.clear();
+                                                let pattern = track.current_pattern();
+                                                for p in 0..120 {
+                                                    for s in 0..128 {
+                                                        if pattern.grid[p][s] > 0 { self.pr_selected_notes.push((p, s)); }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                    self.pr_scroll.x -= scroll_delta.x / zoom_x;
-
-                                    self.pr_scroll.x -= scroll_delta.x / zoom_x;
-
-                                    if response.dragged_by(egui::PointerButton::Middle) {
-                                        let delta = response.drag_delta();
-                                        self.pr_scroll.x -= delta.x / zoom_x;
-                                        self.pr_scroll.y -= delta.y / zoom_y;
+                                    if ui.input(|i| i.key_pressed(egui::Key::D) && i.modifiers.ctrl) {
+                                        self.pr_selected_notes.clear();
                                     }
+                                    if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+                                        if let Some(t_idx) = self.selected_track {
+                                            if let Some(track) = graph.engine.tracks.get_mut(t_idx) {
+                                                let pattern = track.current_pattern_mut();
+                                                for &(p, s) in &self.pr_selected_notes { pattern.grid[p][s] = 0; }
+                                                self.pr_selected_notes.clear();
+                                            }
+                                        }
+                                    }
+                                    // Alt + Wheel to change default note length
+                                    let scroll_delta = ui.input(|i| i.raw_scroll_delta);
+                                    if ui.input(|i| i.modifiers.alt) && scroll_delta.y.abs() > 0.1 {
+                                        if scroll_delta.y > 0.0 { self.pr_note_length = (self.pr_note_length + 1).min(16); }
+                                        else { self.pr_note_length = (self.pr_note_length.saturating_sub(1)).max(1); }
+                                    }
+                                }
 
-                                    // Note interaction (Primary button only if clicked on THIS response)
-                                    if let Some(pos) = response.interact_pointer_pos() {
-                                        let piano_key_width_ratio = 0.06;
-                                        let grid_x_start = rect.min.x + rect.width() * piano_key_width_ratio;
-                                        
-                                        let y_idx = ((pos.y - rect.min.y) / zoom_y + self.pr_scroll.y) as i32;
-                                        let pitch_idx = (120 - 1 - y_idx) as i32;
-                                        let midi = 12 + pitch_idx;
-                                        let freq = 440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0);
+                                // --- SCROLL ---
+                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                                if ui.input(|i| i.modifiers.shift) {
+                                    self.pr_scroll.x -= scroll_delta.y / zoom_x;
+                                } else {
+                                    self.pr_scroll.y -= scroll_delta.y / zoom_y;
+                                }
+                                self.pr_scroll.x -= scroll_delta.x / zoom_x;
 
-                                        if let Some(track_idx) = self.selected_track {
-                                            if let Some(track) = graph.engine.tracks.get_mut(track_idx) {
-                                                if ui.input(|i| i.pointer.primary_down()) {
-                                                    if pos.x <= grid_x_start || ui.input(|i| i.pointer.primary_clicked()) {
-                                                        // If we moved to a new note while dragging, or just clicked
+                                if response.dragged_by(egui::PointerButton::Middle) {
+                                    let delta = response.drag_delta();
+                                    self.pr_scroll.x -= delta.x / zoom_x;
+                                    self.pr_scroll.y -= delta.y / zoom_y;
+                                }
+
+                                // === HELPERS ===
+                                let get_grid_coords = |pos: egui::Pos2| -> (i32, i32) {
+                                    let y_idx = ((pos.y - rect.min.y) / zoom_y + self.pr_scroll.y) as i32;
+                                    let pitch_idx = (119 - y_idx) as i32;
+                                    let x_idx = ((pos.x - grid_x_start) / zoom_x + self.pr_scroll.x) as i32;
+                                    (pitch_idx, x_idx)
+                                };
+
+                                let in_bounds = |pitch: i32, step: i32| -> bool {
+                                    pitch >= 0 && pitch < 120 && step >= 0 && step < 128
+                                };
+
+                                // === MOUSE & INTERACTION ===
+                                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                                if let Some(pos) = pointer_pos {
+                                    if rect.contains(pos) {
+                                        let (pitch_idx, x_idx) = get_grid_coords(pos);
+                                        let in_grid = pos.x > grid_x_start && in_bounds(pitch_idx, x_idx);
+                                        let in_keys = pos.x <= grid_x_start && in_bounds(pitch_idx, 0);
+
+                                        if let Some(t_idx) = self.selected_track {
+                                            if let Some(track) = graph.engine.tracks.get_mut(t_idx) {
+                                                if in_keys {
+                                                    let midi = 12 + pitch_idx;
+                                                    let freq = 440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0);
+                                                    if ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) {
                                                         if self.mouse_played_note != Some(freq) {
-                                                            if let Some(old_f) = self.mouse_played_note {
-                                                                track.node.release_freq(old_f);
-                                                            }
+                                                            if let Some(old_f) = self.mouse_played_note { track.node.release_freq(old_f); }
                                                             track.node.trigger_freq(freq);
                                                             self.mouse_played_note = Some(freq);
                                                         }
                                                     }
-                                                }
+                                                } else if in_grid {
+                                                    let p_idx = pitch_idx as usize;
+                                                    let s_idx = x_idx as usize;
+                                                    let pattern = track.current_pattern_mut();
 
-                                                if pos.x > grid_x_start {
-                                                    // Grid edit logic (placing/removing notes)
-                                                    let x_idx = ((pos.x - grid_x_start) / zoom_x + self.pr_scroll.x) as i32;
-                                                    if x_idx >= 0 && x_idx < 128 && pitch_idx >= 0 && pitch_idx < 120 {
-                                                        if ui.input(|i| i.pointer.primary_clicked()) && response.clicked() {
-                                                            track.current_pattern_mut().grid[pitch_idx as usize][x_idx as usize] = 1;
-                                                        } else if ui.input(|i| i.pointer.secondary_clicked()) && response.secondary_clicked() {
-                                                            track.current_pattern_mut().grid[pitch_idx as usize][x_idx as usize] = 0;
+                                                    // Detect note
+                                                    let mut hovered = None;
+                                                    for s in (0..=s_idx).rev() {
+                                                        let l = pattern.grid[p_idx][s];
+                                                        if l > 0 && (s + l as usize) > s_idx {
+                                                            let offset = (pos.x - (grid_x_start + (s as f32 - self.pr_scroll.x) * zoom_x)) / zoom_x;
+                                                            hovered = Some((p_idx, s, l, offset));
+                                                            break;
+                                                        }
+                                                    }
+
+                                                    // Cursor & State
+                                                    if let Some((_, _, l, off)) = hovered {
+                                                        if off > (l as f32 - 0.25) {
+                                                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+                                                        } else {
+                                                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                                                        }
+                                                    } else {
+                                                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
+                                                    }
+
+                                                    // Actions
+                                                    let is_primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+                                                    let is_primary_down = ui.input(|i| i.pointer.primary_down());
+                                                    let is_secondary_down = ui.input(|i| i.pointer.secondary_down());
+
+                                                    if is_primary_pressed {
+                                                        if ui.input(|i| i.modifiers.ctrl) {
+                                                            self.pr_selection = Some((egui::vec2(x_idx as f32, pitch_idx as f32), egui::vec2(x_idx as f32, pitch_idx as f32)));
+                                                        } else if let Some((p, s, l, off)) = hovered {
+                                                            self.pr_last_clicked_note = Some((p, s));
+                                                            if off > (l as f32 - 0.25) { 
+                                                                self.pr_resize_mode = true; 
+                                                            } else { 
+                                                                self.pr_is_dragging = true; 
+                                                            }
+                                                        } else {
+                                                            // FL Studio Style Note Placement
+                                                            pattern.grid[p_idx][s_idx] = self.pr_note_length;
+                                                            self.pr_last_clicked_note = Some((p_idx, s_idx));
+                                                            self.pr_resize_mode = true; // Automatically enter resize mode to drag length out
+                                                        }
+                                                    } else if is_primary_down {
+                                                        if self.pr_is_dragging {
+                                                            if let Some((old_p, old_s)) = self.pr_last_clicked_note {
+                                                                if (old_p != p_idx || old_s != s_idx) && in_bounds(pitch_idx, x_idx) && pattern.grid[p_idx][s_idx] == 0 {
+                                                                    let l = pattern.grid[old_p][old_s];
+                                                                    pattern.grid[old_p][old_s] = 0;
+                                                                    pattern.grid[p_idx][s_idx] = l;
+                                                                    self.pr_last_clicked_note = Some((p_idx, s_idx));
+                                                                }
+                                                            }
+                                                        } else if self.pr_resize_mode {
+                                                            if let Some((p, s)) = self.pr_last_clicked_note {
+                                                                let nl = (x_idx - s as i32 + 1).max(1).min(127) as u8;
+                                                                pattern.grid[p][s] = nl;
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // Right click continuous erase
+                                                    if is_secondary_down {
+                                                        if let Some((p, s, _, _)) = hovered { pattern.grid[p][s] = 0; }
+                                                        else { pattern.grid[p_idx][s_idx] = 0; }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+                                    self.pr_is_dragging = false;
+                                    self.pr_resize_mode = false;
+                                    self.pr_last_clicked_note = None;
+                                    self.pr_draw_mode = None;
+                                    if let Some(freq) = self.mouse_played_note.take() {
+                                        if let Some(t_idx) = self.selected_track {
+                                            if let Some(track) = graph.engine.tracks.get_mut(t_idx) { track.node.release_freq(freq); }
+                                        }
+                                    }
+                                    // Area Selection Apply
+                                    if let Some((start, end)) = self.pr_selection.take() {
+                                        let (mx, mmx) = (start.x.min(end.x) as usize, start.x.max(end.x) as usize);
+                                        let (my, mmy) = (start.y.min(end.y) as usize, start.y.max(end.y) as usize);
+                                        if let Some(t_idx) = self.selected_track {
+                                            if let Some(track) = graph.engine.tracks.get(t_idx) {
+                                                self.pr_selected_notes.clear();
+                                                for y in my..=mmy {
+                                                    for x in mx..=mmx {
+                                                        if y < 120 && x < 128 && track.current_pattern().grid[y][x] > 0 {
+                                                            self.pr_selected_notes.push((y, x));
                                                         }
                                                     }
                                                 }
                                             }
                                         }
                                     }
+                                }
+                                
+                                if ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) && ui.input(|i| i.modifiers.ctrl) {
+                                    if let Some(sel) = self.pr_selection.as_mut() {
+                                        let (p, x) = get_grid_coords(ui.input(|i| i.pointer.interact_pos().unwrap_or(egui::pos2(0.0,0.0))));
+                                        sel.1 = egui::vec2(x as f32, p as f32);
+                                    }
+                                }
 
-                                    // Global release handling for mouse played notes
-                                    if ui.input(|i| i.pointer.primary_released()) {
-                                        if let Some(freq) = self.mouse_played_note {
-                                            if let Some(track_idx) = self.selected_track {
-                                                if let Some(track) = graph.engine.tracks.get_mut(track_idx) {
-                                                    track.node.release_freq(freq);
+
+                                // === DRAWING ===
+                                let painter = ui.painter_at(rect);
+                                
+                                // 1. Render Notes Overlay (Labels/Glow)
+                                if let Some(t_idx) = self.selected_track {
+                                    if let Some(track) = graph.engine.tracks.get(t_idx) {
+                                        let pattern = track.current_pattern();
+                                        let start_p = (self.pr_scroll.y) as i32;
+                                        let end_p = (start_p + (grid_h / zoom_y) as i32 + 2).min(120);
+                                        let start_s = (self.pr_scroll.x) as i32;
+                                        let end_s = (start_s + (grid_w / zoom_x) as i32 + 2).min(128);
+
+                                        for p in (120 - end_p)..(120 - start_p) {
+                                            let p_idx = p as usize;
+                                            let riv = (119 - p) as f32 - self.pr_scroll.y;
+                                            let ys = rect.min.y + riv * zoom_y;
+
+                                            for s in start_s..end_s {
+                                                let s_idx = s as usize;
+                                                let len = pattern.grid[p_idx][s_idx];
+                                                if len > 0 {
+                                                    let civ = s as f32 - self.pr_scroll.x;
+                                                    let nr = egui::Rect::from_min_size(
+                                                        egui::pos2(grid_x_start + civ * zoom_x, ys),
+                                                        egui::vec2(len as f32 * zoom_x, zoom_y)
+                                                    ).shrink(1.0);
+                                                    
+                                                    let is_sel = self.pr_selected_notes.contains(&(p_idx, s_idx));
+                                                    
+                                                    // Beautiful gradients and strokes for commercial feel
+                                                    let fill_color = if is_sel { egui::Color32::from_rgb(30, 200, 200) } else { egui::Color32::from_rgb(30, 120, 255) };
+                                                    let stroke_color = if is_sel { egui::Color32::WHITE } else { egui::Color32::WHITE.gamma_multiply(0.4) };
+                                                    
+                                                    painter.rect_filled(nr, 3.0, fill_color);
+                                                    painter.rect_stroke(nr, 3.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Inside);
+                                                    painter.rect_stroke(nr, 3.0, egui::Stroke::new(1.0, egui::Color32::BLACK.gamma_multiply(0.6)), egui::StrokeKind::Outside);
+                                                    
+                                                    // Drag handle marker on the right edge (Interactive indicator)
+                                                    if nr.width() > 10.0 {
+                                                        let handle_rect = egui::Rect::from_min_max(
+                                                            egui::pos2(nr.max.x - 5.0, nr.min.y + 4.0),
+                                                            egui::pos2(nr.max.x - 2.0, nr.max.y - 4.0),
+                                                        );
+                                                        painter.rect_filled(handle_rect, 1.0, egui::Color32::WHITE.gamma_multiply(0.5));
+                                                    }
+                                                    
+                                                    // Centered, readable note name
+                                                    if nr.width() > 25.0 {
+                                                        let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+                                                        let name = format!("{}{}", names[p_idx % 12], p_idx / 12 - 1);
+                                                        painter.text(
+                                                            egui::pos2(nr.min.x + 6.0, nr.center().y),
+                                                            egui::Align2::LEFT_CENTER,
+                                                            name, 
+                                                            egui::FontId::proportional(11.0), 
+                                                            egui::Color32::WHITE.gamma_multiply(0.9)
+                                                        );
+                                                    }
                                                 }
                                             }
-                                            self.mouse_played_note = None;
                                         }
                                     }
                                 }
 
-                                // Note names (piano keys background)
-                                let painter = ui.painter_at(rect);
-                                for pitch in 0..120 {
-                                    let row_in_view = (120 - 1 - pitch) as f32 - self.pr_scroll.y;
-                                    let y_start = rect.min.y + row_in_view * zoom_y;
-                                    if y_start > rect.min.y - zoom_y && y_start < rect.max.y {
-                                        let midi = 12 + pitch;
-                                        let note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-                                        let name = format!("{}{}", note_names[midi % 12], midi / 12 - 1);
+                                // Keys & Names
+                                for p in 0..120 {
+                                    let riv = (119 - p) as f32 - self.pr_scroll.y;
+                                    let ys = rect.min.y + riv * zoom_y;
+                                    if ys > rect.min.y - zoom_y && ys < rect.max.y {
+                                        let midi = 12 + p;
+                                        let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+                                        let is_b = [1,3,6,8,10].contains(&(midi%12));
                                         painter.text(
-                                            egui::pos2(rect.min.x + 3.0, y_start + zoom_y/2.0),
+                                            egui::pos2(rect.min.x + 4.0, ys + zoom_y/2.0),
                                             egui::Align2::LEFT_CENTER,
-                                            name,
-                                            egui::FontId::proportional(zoom_y.min(11.0).max(7.0)),
-                                            if [1, 3, 6, 8, 10].contains(&(midi % 12)) { egui::Color32::GRAY.gamma_multiply(0.4) } else { egui::Color32::WHITE.gamma_multiply(0.2) }
+                                            format!("{}{}", names[midi%12], midi/12 - 1),
+                                            egui::FontId::proportional(10.0),
+                                            if is_b { egui::Color32::from_gray(80) } else { egui::Color32::from_gray(180) }
                                         );
                                     }
                                 }
 
-                                // Vertical Slider
+                                // Area Selection Rendering
+                                if let Some((s, e)) = self.pr_selection {
+                                    let sr = egui::Rect::from_min_max(
+                                        egui::pos2(grid_x_start + (s.x.min(e.x) - self.pr_scroll.x) * zoom_x, rect.min.y + (119.0 - s.y.max(e.y) - self.pr_scroll.y) * zoom_y),
+                                        egui::pos2(grid_x_start + (s.x.max(e.x) - self.pr_scroll.x + 1.0) * zoom_x, rect.min.y + (119.0 - s.y.min(e.y) - self.pr_scroll.y + 1.0) * zoom_y)
+                                    );
+                                    painter.rect_filled(sr, 0.0, egui::Color32::from_rgba_unmultiplied(0, 150, 255, 40));
+                                    painter.rect_stroke(sr, 0.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 150, 255)), egui::StrokeKind::Inside);
+                                }
+
+                                // Selection Glow
+                                if let Some(t_idx) = self.selected_track {
+                                    if let Some(track) = graph.engine.tracks.get(t_idx) {
+                                        for &(p, s) in &self.pr_selected_notes {
+                                            let l = track.current_pattern().grid[p][s];
+                                            let riv = (119 - p) as f32 - self.pr_scroll.y;
+                                            let civ = s as f32 - self.pr_scroll.x;
+                                            let nr = egui::Rect::from_min_size(
+                                                egui::pos2(grid_x_start + civ * zoom_x, rect.min.y + riv * zoom_y),
+                                                egui::vec2(l as f32 * zoom_x, zoom_y)
+                                            ).shrink(1.0);
+                                            if rect.intersects(nr) {
+                                                painter.rect_stroke(nr.expand(2.0), 2.0, egui::Stroke::new(1.5, egui::Color32::WHITE.gamma_multiply(0.3)), egui::StrokeKind::Outside);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Sliders
                                 ui.spacing_mut().slider_width = grid_h;
-                                let mut pr_scroll_inv_y = 120.0 - self.pr_scroll.y;
-                                ui.add(egui::Slider::new(&mut pr_scroll_inv_y, 0.0..=120.0).vertical().show_value(false));
-                                self.pr_scroll.y = 120.0 - pr_scroll_inv_y;
+                                let mut scroll_inv_y = 120.0 - self.pr_scroll.y;
+                                ui.add(egui::Slider::new(&mut scroll_inv_y, 0.0..=120.0).vertical().show_value(false));
+                                self.pr_scroll.y = 120.0 - scroll_inv_y;
                             });
 
                             ui.horizontal(|ui| {
-                                ui.add_space(grid_w * 0.06); // piano keys offset
+                                ui.add_space(grid_w * 0.06); 
                                 ui.spacing_mut().slider_width = grid_w * 0.94;
-                                let mut pr_scroll_x = self.pr_scroll.x;
-                                ui.add(egui::Slider::new(&mut pr_scroll_x, 0.0..=128.0).show_value(false));
-                                self.pr_scroll.x = pr_scroll_x;
+                                let mut scroll_x = self.pr_scroll.x;
+                                ui.add(egui::Slider::new(&mut scroll_x, 0.0..=128.0).show_value(false));
+                                self.pr_scroll.x = scroll_x;
                             });
 
-                            // Clamping
                             let vis_n = grid_h / 25.0;
                             let vis_s = grid_w / 60.0;
                             self.pr_scroll.x = self.pr_scroll.x.clamp(0.0, (128.0_f32 - vis_s).max(0.0_f32));

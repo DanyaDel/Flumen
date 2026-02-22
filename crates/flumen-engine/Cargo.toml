@@ -7,3 +7,4 @@ edition = "2021"
 flumen-common = { path = "../flumen-common" }
 cpal = { workspace = true }
 log = { workspace = true }
+hound = "3.5"
