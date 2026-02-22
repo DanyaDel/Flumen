@@ -32,6 +32,7 @@ pub struct State {
     pub pr_is_dragging: bool,
     pub pr_hover_note: Option<(usize, usize, f32)>, // pitch, step, offset_in_note
     pub pr_resize_mode: bool,
+    pub pr_zoom: egui::Vec2, // zoom level (pixels per step/note)
     // Favus state
     pub favus_scroll: egui::Vec2,
     pub active_item_idx: Option<usize>, // item being dragged or resized
@@ -139,6 +140,7 @@ impl State {
             pr_is_dragging: false,
             pr_hover_note: None,
             pr_resize_mode: false,
+            pr_zoom: egui::vec2(60.0, 25.0),
             favus_scroll: egui::Vec2::ZERO,
             active_item_idx: None,
             is_resizing: false,
@@ -240,8 +242,8 @@ impl State {
         
         // --- 1. Update Grid Metrics for Renderer ---
         let rect = self.central_panel_rect;
-        let zoom_x = 60.0;
-        let zoom_y = 25.0;
+        let zoom_x = self.pr_zoom.x;
+        let zoom_y = self.pr_zoom.y;
         
         let piano_key_width_ratio = 0.06; 
         let grid_w = rect.width() * (1.0 - piano_key_width_ratio);
@@ -747,7 +749,7 @@ impl State {
                                 ui.separator();
                                 ui.label(format!("Length: {} steps", self.pr_note_length));
                                 ui.separator();
-                                ui.label(egui::RichText::new("Alt+Wheel: Note Size").size(10.0).color(egui::Color32::GRAY));
+                                ui.label(egui::RichText::new("Alt+Wheel: Note Size | Ctrl+Wheel: V-Zoom | +Shift: H-Zoom").size(10.0).color(egui::Color32::GRAY));
                                 ui.separator();
                                 ui.label(egui::RichText::new("Shift+Click: Select").size(10.0).color(egui::Color32::GRAY));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -772,8 +774,8 @@ impl State {
                                 self.central_panel_rect = rect;
                                 central_rect = rect;
 
-                                let zoom_x = 60.0;
-                                let zoom_y = 25.0;
+                                let zoom_x = self.pr_zoom.x;
+                                let zoom_y = self.pr_zoom.y;
                                 let piano_key_width_ratio = 0.06;
                                 let grid_x_start = rect.min.x + rect.width() * piano_key_width_ratio;
 
@@ -810,16 +812,30 @@ impl State {
                                         if scroll_delta.y > 0.0 { self.pr_note_length = (self.pr_note_length + 1).min(16); }
                                         else { self.pr_note_length = (self.pr_note_length.saturating_sub(1)).max(1); }
                                     }
+
+                                    // Ctrl + Wheel to Zoom
+                                    let zoom_delta = if scroll_delta.y.abs() > scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+                                    if ui.input(|i| i.modifiers.ctrl) && zoom_delta.abs() > 0.1 {
+                                        let zoom_factor = if zoom_delta > 0.0 { 1.1 } else { 0.9 };
+                                        
+                                        if ui.input(|i| i.modifiers.shift) {
+                                            self.pr_zoom.x = (self.pr_zoom.x * zoom_factor).clamp(10.0, 300.0);
+                                        } else {
+                                            self.pr_zoom.y = (self.pr_zoom.y * zoom_factor).clamp(5.0, 100.0);
+                                        }
+                                    }
                                 }
 
                                 // --- SCROLL ---
                                 let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                if ui.input(|i| i.modifiers.shift) {
-                                    self.pr_scroll.x -= scroll_delta.y / zoom_x;
-                                } else {
-                                    self.pr_scroll.y -= scroll_delta.y / zoom_y;
+                                if !ui.input(|i| i.modifiers.ctrl) {
+                                    if ui.input(|i| i.modifiers.shift) {
+                                        self.pr_scroll.x -= scroll_delta.y / zoom_x;
+                                    } else {
+                                        self.pr_scroll.y -= scroll_delta.y / zoom_y;
+                                    }
+                                    self.pr_scroll.x -= scroll_delta.x / zoom_x;
                                 }
-                                self.pr_scroll.x -= scroll_delta.x / zoom_x;
 
                                 if response.dragged_by(egui::PointerButton::Middle) {
                                     let delta = response.drag_delta();
@@ -1098,8 +1114,8 @@ impl State {
                                 self.pr_scroll.x = scroll_x;
                             });
 
-                            let vis_n = grid_h / 25.0;
-                            let vis_s = grid_w / 60.0;
+                            let vis_n = grid_h / self.pr_zoom.y;
+                            let vis_s = grid_w / self.pr_zoom.x;
                             self.pr_scroll.x = self.pr_scroll.x.clamp(0.0, (128.0_f32 - vis_s).max(0.0_f32));
                             self.pr_scroll.y = self.pr_scroll.y.clamp(0.0, (120.0_f32 - vis_n).max(0.0_f32));
                         });
