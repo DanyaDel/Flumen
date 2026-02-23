@@ -434,6 +434,44 @@ impl SequencerEngine {
         let samples_per_beat = context.sample_rate / beats_per_second;
         self.samples_per_step = samples_per_beat / 4.0;
     }
+
+    /// Клонирование для рендеринга (без потоков)
+    pub fn clone_for_render(&self) -> RenderSequencerEngine {
+        RenderSequencerEngine {
+            tracks: self.tracks.iter().map(|t| {
+                // Для рендера создаём новый синтезатор с теми же параметрами
+                let new_node: Box<dyn AudioNode> = if let Some(poly) = t.node.as_any().downcast_ref::<PolySynth>() {
+                    let mut new_poly = PolySynth::new(poly.waveform);
+                    new_poly.set_adsr(poly.adsr);
+                    new_poly.unison_count = poly.unison_count;
+                    new_poly.unison_detune = poly.unison_detune;
+                    new_poly.unison_blend = poly.unison_blend;
+                    new_poly.octave_offset = poly.octave_offset;
+                    Box::new(new_poly)
+                } else if let Some(voice) = t.node.as_any().downcast_ref::<SynthVoice>() {
+                    Box::new(SynthVoice::new(voice.frequency, voice.waveform))
+                } else {
+                    Box::new(PolySynth::new(Waveform::Sine))
+                };
+                EngineTrack {
+                    node: new_node,
+                    patterns: t.patterns.clone(),
+                    current_pattern_idx: t.current_pattern_idx,
+                    volume: t.volume,
+                    pan: t.pan,
+                }
+            }).collect(),
+            playlist: self.playlist.clone(),
+            bpm: self.bpm,
+        }
+    }
+}
+
+/// Упрощённая версия SequencerEngine для рендеринга
+pub struct RenderSequencerEngine {
+    pub tracks: Vec<EngineTrack>,
+    pub playlist: Vec<ArrangementItem>,
+    pub bpm: f32,
 }
 
 pub struct Omnia {
@@ -457,6 +495,32 @@ pub struct Omnia {
 
     lp_l: f32, lp_r: f32,
     hp_l: f32, hp_r: f32,
+}
+
+impl Clone for Omnia {
+    fn clone(&self) -> Self {
+        Self {
+            delay_time: self.delay_time,
+            delay_feedback: self.delay_feedback,
+            delay_mix: self.delay_mix,
+            reverb_size: self.reverb_size,
+            reverb_mix: self.reverb_mix,
+            eq_low: self.eq_low,
+            eq_high: self.eq_high,
+            dist_drive: self.dist_drive,
+            dist_mix: self.dist_mix,
+            is_enabled: self.is_enabled,
+            delay_buffer_l: self.delay_buffer_l.clone(),
+            delay_buffer_r: self.delay_buffer_r.clone(),
+            delay_ptr: self.delay_ptr,
+            rev_buffer: self.rev_buffer.clone(),
+            rev_ptr: self.rev_ptr,
+            lp_l: self.lp_l,
+            lp_r: self.lp_r,
+            hp_l: self.hp_l,
+            hp_r: self.hp_r,
+        }
+    }
 }
 
 impl Omnia {
@@ -786,7 +850,7 @@ impl AudioGraph {
         for i in 0..num_frames {
             let mut l = left_buffer[i];
             let mut r = right_buffer[i];
-            
+
             // Omnia Master FX
             self.omnia.process(&mut l, &mut r, context.sample_rate);
 
@@ -794,6 +858,494 @@ impl AudioGraph {
             output_buffer[i * 2] = l.clamp(-1.0, 1.0);
             output_buffer[i * 2 + 1] = r.clamp(-1.0, 1.0);
         }
+    }
+
+    /// Клонирование графа для рендеринга (оффлайн экспорт)
+    pub fn clone_for_render(&self) -> RenderGraph {
+        RenderGraph {
+            engine: self.engine.clone_for_render(),
+            omnia: self.omnia.clone(),
+        }
+    }
+}
+
+/// Упрощённая версия AudioGraph для оффлайн рендеринга
+pub struct RenderGraph {
+    pub engine: RenderSequencerEngine,
+    pub omnia: Omnia,
+}
+
+impl RenderGraph {
+    /// Рендеринг одного буфера для экспорта
+    pub fn render_buffer(
+        &mut self,
+        output_buffer: &mut [f32],
+        context: &ProcessContext,
+        current_step: &mut usize,
+        sample_counter: &mut f32,
+        samples_per_step: f32,
+        active_notes: &mut Vec<(usize, usize, u8)>,
+    ) {
+        let num_channels = 2;
+        let num_frames = output_buffer.len() / num_channels;
+
+        let mut left_buffer = vec![0.0; num_frames];
+        let mut right_buffer = vec![0.0; num_frames];
+        let mut node_output = vec![0.0; num_frames];
+
+        // Обработка тайминга и триггеров
+        for _f in 0..num_frames {
+            if *sample_counter == 0.0 {
+                // Release завершённых нот
+                let mut i = 0;
+                while i < active_notes.len() {
+                    active_notes[i].2 -= 1;
+                    if active_notes[i].2 == 0 {
+                        let (track_idx, pitch, _) = active_notes.remove(i);
+                        if let Some(track) = self.engine.tracks.get_mut(track_idx) {
+                            // Вычисляем частоту для релиза
+                            let midi = 12 + pitch as i32;
+                            let freq = 440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0);
+                            track.node.release_freq(freq);
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                // Trigger новых нот — сначала собираем, потом триггерим
+                let mut notes_to_trigger: Vec<(usize, usize, f32, u8)> = Vec::new();
+                for (track_idx, track) in self.engine.tracks.iter().enumerate() {
+                    let pattern = track.current_pattern();
+                    for pitch_idx in 0..120 {
+                        let len = pattern.grid[pitch_idx][*current_step];
+                        if len > 0 {
+                            let midi = 12 + pitch_idx as i32;
+                            let freq = 440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0);
+                            notes_to_trigger.push((track_idx, pitch_idx, freq, len));
+                        }
+                    }
+                }
+
+                // Теперь триггерим
+                for (track_idx, pitch_idx, freq, len) in notes_to_trigger {
+                    if let Some(track) = self.engine.tracks.get_mut(track_idx) {
+                        track.node.trigger_freq(freq);
+                    }
+                    active_notes.push((track_idx, pitch_idx, len));
+                }
+            }
+
+            *sample_counter += 1.0;
+            if *sample_counter >= samples_per_step {
+                *sample_counter = 0.0;
+                *current_step = (*current_step + 1) % 128;
+            }
+        }
+
+        // Рендеринг дорожек
+        for track in &mut self.engine.tracks {
+            for s in node_output.iter_mut() {
+                *s = 0.0;
+            }
+
+            let mut outputs_ptr = [&mut node_output[..]];
+            track.node.process(&mut outputs_ptr, context);
+
+            let pan_l = (1.0 - track.pan).min(1.0).max(0.0).sqrt();
+            let pan_r = (1.0 + track.pan).min(1.0).max(0.0).sqrt();
+            let vol = track.volume;
+
+            for (i, sample) in node_output.iter().enumerate() {
+                left_buffer[i] += sample * vol * pan_l;
+                right_buffer[i] += sample * vol * pan_r;
+            }
+        }
+
+        // Интерливинг и FX
+        for i in 0..num_frames {
+            let mut l = left_buffer[i];
+            let mut r = right_buffer[i];
+
+            self.omnia.process(&mut l, &mut r, context.sample_rate);
+
+            output_buffer[i * 2] = l.clamp(-1.0, 1.0);
+            output_buffer[i * 2 + 1] = r.clamp(-1.0, 1.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_RATE: f32 = 48000.0;
+    const BUFFER_SIZE: usize = 480;
+
+    fn create_context() -> ProcessContext {
+        ProcessContext {
+            sample_rate: SAMPLE_RATE,
+            buffer_size: BUFFER_SIZE,
+            bpm: 120.0,
+        }
+    }
+
+    #[test]
+    fn test_sine_wave_no_clipping() {
+        let mut voice = SynthVoice::new(440.0, Waveform::Sine);
+        voice.trigger();
+        
+        let mut output = vec![0.0; BUFFER_SIZE];
+        let ctx = create_context();
+        
+        voice.process(&mut [&mut output], &ctx);
+        
+        let has_signal = output.iter().any(|&s| s.abs() > 0.01);
+        assert!(has_signal, "Sine wave должна генерировать сигнал");
+        
+        for (i, &sample) in output.iter().enumerate() {
+            assert!(
+                sample.abs() <= 1.0,
+                "Клиппинг на сэмпле #{}: {}", i, sample
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_waveforms_no_clipping() {
+        let waveforms = [Waveform::Sine, Waveform::Saw, Waveform::Square, Waveform::Triangle];
+        
+        for waveform in waveforms {
+            let mut voice = SynthVoice::new(440.0, waveform);
+            voice.trigger();
+            
+            let mut output = vec![0.0; BUFFER_SIZE];
+            let ctx = create_context();
+            voice.process(&mut [&mut output], &ctx);
+            
+            for (i, &sample) in output.iter().enumerate() {
+                assert!(
+                    sample.is_finite(),
+                    "Некорректное значение для {:?} на сэмпле #{}", waveform, i
+                );
+                assert!(
+                    sample.abs() <= 1.0,
+                    "Клиппинг для {:?} на сэмпле #{}: {}", waveform, i, sample
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_adsr_attack_phase() {
+        let mut voice = SynthVoice::new(440.0, Waveform::Sine);
+        voice.adsr.attack = 0.1;
+        voice.adsr.decay = 0.1;
+        voice.adsr.sustain = 0.5;
+        voice.trigger();
+        
+        let ctx = create_context();
+        let samples_per_ms = SAMPLE_RATE / 1000.0;
+        
+        let mut prev_envelope = 0.0;
+        for _ in 0..(samples_per_ms * 50.0) as usize {
+            let mut output = [0.0];
+            voice.process(&mut [&mut output], &ctx);
+            
+            assert!(
+                voice.envelope_val >= prev_envelope,
+                "Огибающая должна расти во время атаки"
+            );
+            prev_envelope = voice.envelope_val;
+        }
+        
+        assert!(prev_envelope > 0.3, "После 50ms атаки огибающая должна быть > 0.3 (получено {})", prev_envelope);
+    }
+
+    #[test]
+    fn test_adsr_release_phase() {
+        let mut voice = SynthVoice::new(440.0, Waveform::Sine);
+        voice.adsr.attack = 0.01;
+        voice.adsr.release = 0.1;
+        voice.trigger();
+        
+        let ctx = create_context();
+        
+        for _ in 0..1000 {
+            let mut output = [0.0];
+            voice.process(&mut [&mut output], &ctx);
+        }
+        
+        let peak_envelope = voice.envelope_val;
+        voice.release();
+        
+        let mut prev_envelope = voice.envelope_val;
+        for _ in 0..100 {
+            let mut output = [0.0];
+            voice.process(&mut [&mut output], &ctx);
+            
+            assert!(
+                voice.envelope_val <= prev_envelope,
+                "Огибающая должна падать во время релиза"
+            );
+            prev_envelope = voice.envelope_val;
+        }
+        
+        assert!(voice.envelope_val < peak_envelope);
+    }
+
+    #[test]
+    fn test_voice_deterministic() {
+        let mut voice1 = SynthVoice::new(440.0, Waveform::Sine);
+        let mut voice2 = SynthVoice::new(440.0, Waveform::Sine);
+        
+        voice1.trigger();
+        voice2.trigger();
+        
+        let mut output1 = vec![0.0; BUFFER_SIZE];
+        let mut output2 = vec![0.0; BUFFER_SIZE];
+        let ctx = create_context();
+        
+        voice1.process(&mut [&mut output1], &ctx);
+        voice2.process(&mut [&mut output2], &ctx);
+        
+        assert_eq!(output1, output2, "Одинаковые голоса должны давать одинаковый выход");
+    }
+
+    #[test]
+    fn test_polysynth_trigger() {
+        let mut synth = PolySynth::new(Waveform::Saw);
+        synth.trigger_freq(440.0);
+        
+        let active_voices = synth.voices.iter().filter(|v| v.is_triggered).count();
+        assert!(active_voices > 0, "После trigger_freq хотя бы один голос должен быть активен");
+    }
+
+    #[test]
+    fn test_polysynth_unison() {
+        let mut synth = PolySynth::new(Waveform::Sine);
+        synth.unison_count = 3;
+        synth.unison_detune = 0.1;
+        synth.trigger_freq(440.0);
+        
+        let active_voices = synth.voices.iter().filter(|v| v.is_triggered).count();
+        assert_eq!(active_voices, 3, "Unison должен активировать 3 голоса");
+    }
+
+    #[test]
+    fn test_polysynth_release_freq() {
+        let mut synth = PolySynth::new(Waveform::Sine);
+        synth.trigger_freq(440.0);
+        synth.trigger_freq(880.0);
+        
+        synth.release_freq(440.0);
+        
+        let still_active = synth.voices.iter()
+            .filter(|v| v.is_triggered && (v.base_frequency - 880.0).abs() < 1.0)
+            .count();
+        
+        assert!(still_active > 0, "Голоса на 880 Гц должны остаться после release_freq(440)");
+    }
+
+    #[test]
+    fn test_omnia_distortion() {
+        let mut omnia = Omnia::new();
+        omnia.dist_drive = 0.8;
+        omnia.dist_mix = 1.0;
+        
+        let mut signal_l = 0.5;
+        let mut signal_r = 0.5;
+        let original_l = signal_l;
+        
+        omnia.process(&mut signal_l, &mut signal_r, SAMPLE_RATE);
+        
+        assert!(
+            (signal_l - original_l).abs() > 0.01,
+            "Дисторшн должен изменять сигнал"
+        );
+        assert!(signal_l.abs() <= 1.5, "Выход дисторшна не должен превышать 1.5");
+    }
+
+    #[test]
+    fn test_omnia_delay() {
+        let mut omnia = Omnia::new();
+        omnia.delay_time = 0.1;
+        omnia.delay_feedback = 0.5;
+        omnia.delay_mix = 1.0;
+
+        let mut signal_l = 0.0;
+        let mut signal_r = 0.0;
+        let mut output_history = Vec::new();
+
+        for i in 0..6000 {
+            if i == 0 {
+                signal_l = 1.0;
+                signal_r = 1.0;
+            } else {
+                signal_l = 0.0;
+                signal_r = 0.0;
+            }
+            omnia.process(&mut signal_l, &mut signal_r, SAMPLE_RATE);
+            output_history.push(signal_l);
+        }
+
+        // Delay должен создать повторение через ~0.1 сек = ~4800 сэмплов
+        let has_delay_repeat = output_history.iter()
+            .skip(4000)
+            .any(|&v| v.abs() > 0.001);
+
+        assert!(
+            has_delay_repeat,
+            "Delay должен создавать повторения сигнала (max был {})",
+            output_history.iter().skip(4000).map(|&v| v.abs()).fold(0.0, f32::max)
+        );
+    }
+
+    #[test]
+    fn test_omnia_bypass() {
+        let mut omnia = Omnia::new();
+        omnia.is_enabled = false;
+        
+        let mut signal_l = 0.5;
+        let mut signal_r = 0.5;
+        let original_l = signal_l;
+        let original_r = signal_r;
+        
+        omnia.process(&mut signal_l, &mut signal_r, SAMPLE_RATE);
+        
+        assert_eq!(signal_l, original_l, "В bypass режиме сигнал не должен изменяться");
+        assert_eq!(signal_r, original_r, "В bypass режиме сигнал не должен изменяться");
+    }
+
+    #[test]
+    fn test_omnia_no_clipping() {
+        let mut omnia = Omnia::new();
+        omnia.dist_drive = 1.0;
+        omnia.delay_feedback = 0.9;
+        omnia.reverb_mix = 1.0;
+        
+        let mut signal_l = 1.0;
+        let mut signal_r = 1.0;
+        
+        for _ in 0..1000 {
+            omnia.process(&mut signal_l, &mut signal_r, SAMPLE_RATE);
+            assert!(signal_l.abs() <= 2.0, "Выход Omnia не должен превышать 2.0 (L)");
+            assert!(signal_r.abs() <= 2.0, "Выход Omnia не должен превышать 2.0 (R)");
+        }
+    }
+
+    #[test]
+    fn test_pattern_default_empty() {
+        let pattern = Pattern::default();
+        
+        for pitch in 0..120 {
+            for step in 0..128 {
+                assert_eq!(pattern.grid[pitch][step], 0, "Паттерн по умолчанию должен быть пустым");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pattern_conversion() {
+        let mut common_pattern = flumen_common::project::Pattern {
+            grid: vec![vec![0; 128]; 120],
+        };
+        common_pattern.grid[60][0] = 16;
+        
+        let engine_pattern = Pattern::from(common_pattern.clone());
+        let back_to_common = flumen_common::project::Pattern::from(&engine_pattern);
+        
+        assert_eq!(back_to_common.grid[60][0], 16, "Конверсия должна сохранять данные паттерна");
+    }
+
+    #[test]
+    fn test_zero_frequency() {
+        let mut voice = SynthVoice::new(0.0, Waveform::Sine);
+        voice.trigger();
+        
+        let mut output = vec![0.0; BUFFER_SIZE];
+        let ctx = create_context();
+        voice.process(&mut [&mut output], &ctx);
+        
+        for (i, &sample) in output.iter().enumerate() {
+            assert!(
+                sample.is_finite(),
+                "Некорректное значение при частоте 0 Гц на сэмпле #{}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_very_high_frequency() {
+        let mut voice = SynthVoice::new(20000.0, Waveform::Sine);
+        voice.trigger();
+        
+        let mut output = vec![0.0; BUFFER_SIZE];
+        let ctx = create_context();
+        voice.process(&mut [&mut output], &ctx);
+        
+        for (i, &sample) in output.iter().enumerate() {
+            assert!(
+                sample.is_finite(),
+                "Некорректное значение при 20 kHz на сэмпле #{}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_adsr_zero_values() {
+        let mut voice = SynthVoice::new(440.0, Waveform::Sine);
+        voice.adsr.attack = 0.0;
+        voice.adsr.decay = 0.0;
+        voice.adsr.release = 0.0;
+        voice.trigger();
+        
+        let mut output = vec![0.0; BUFFER_SIZE];
+        let ctx = create_context();
+        
+        voice.process(&mut [&mut output], &ctx);
+        
+        for (i, &sample) in output.iter().enumerate() {
+            assert!(
+                sample.is_finite(),
+                "Некорректное значение при нулевых ADSR на сэмпле #{}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_buffer_processing() {
+        let mut voice = SynthVoice::new(440.0, Waveform::Sine);
+        voice.trigger();
+        
+        let mut output = vec![];
+        let ctx = create_context();
+        
+        voice.process(&mut [&mut output], &ctx);
+    }
+
+    #[test]
+    fn test_sequencer_step_timing() {
+        let mut engine = SequencerEngine::new();
+        engine.bpm = 120.0;
+        engine.is_playing = true;
+        
+        let ctx = ProcessContext {
+            sample_rate: SAMPLE_RATE,
+            buffer_size: BUFFER_SIZE,
+            bpm: 120.0,
+        };
+        
+        engine.update_timing(&ctx);
+        
+        let expected_samples_per_step = (SAMPLE_RATE / 2.0) / 4.0;
+        
+        assert!(
+            (engine.samples_per_step - expected_samples_per_step).abs() < 1.0,
+            "Неверный расчёт сэмплов на шаг: ожидалось {}, получено {}",
+            expected_samples_per_step,
+            engine.samples_per_step
+        );
     }
 }
 
