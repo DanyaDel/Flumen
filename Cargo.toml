@@ -4,6 +4,11 @@ members = [
     "crates/flumen-engine",
     "crates/flumen-gui",
     "crates/flumen-common",
+    "plugins/flumen-reverb",
+    "plugins/flumen-delay",
+    "plugins/flumen-compressor",
+    "plugins/flumen-eq",
+    "plugins/flumen-limiter",
 ]
 
 [workspace.dependencies]

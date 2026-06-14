@@ -372,12 +372,73 @@ impl From<&Pattern> for flumen_common::project::Pattern {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct AutomationPoint {
+    pub step: f32,
+    pub value: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct AutomationLane {
+    pub param_name: String,
+    pub points: Vec<AutomationPoint>,
+}
+
+impl AutomationLane {
+    pub fn new(param_name: &str) -> Self {
+        Self {
+            param_name: param_name.to_string(),
+            points: Vec::new(),
+        }
+    }
+
+    pub fn add_point(&mut self, step: f32, value: f32) {
+        self.points.push(AutomationPoint { step, value });
+        self.points.sort_by(|a, b| a.step.partial_cmp(&b.step).unwrap());
+    }
+
+    pub fn remove_point(&mut self, step: f32, tolerance: f32) -> bool {
+        if let Some(pos) = self.points.iter().position(|p| (p.step - step).abs() < tolerance) {
+            self.points.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_value(&self, step: f32) -> f32 {
+        if self.points.is_empty() {
+            return 0.0;
+        }
+
+        if step <= self.points[0].step {
+            return self.points[0].value;
+        }
+
+        if step >= self.points.last().unwrap().step {
+            return self.points.last().unwrap().value;
+        }
+
+        for i in 0..self.points.len() - 1 {
+            let p0 = &self.points[i];
+            let p1 = &self.points[i + 1];
+            if step >= p0.step && step <= p1.step {
+                let t = (step - p0.step) / (p1.step - p0.step);
+                return p0.value + t * (p1.value - p0.value);
+            }
+        }
+
+        0.0
+    }
+}
+
 pub struct EngineTrack {
     pub node: Box<dyn AudioNode>,
     pub patterns: Vec<Pattern>,
     pub current_pattern_idx: usize,
     pub volume: f32,
     pub pan: f32,
+    pub automation: Vec<AutomationLane>,
 }
 
 impl EngineTrack {
@@ -386,6 +447,45 @@ impl EngineTrack {
     }
     pub fn current_pattern_mut(&mut self) -> &mut Pattern {
         &mut self.patterns[self.current_pattern_idx]
+    }
+
+    pub fn add_pattern(&mut self) -> usize {
+        self.patterns.push(Pattern::default());
+        let idx = self.patterns.len() - 1;
+        self.current_pattern_idx = idx;
+        idx
+    }
+
+    pub fn duplicate_pattern(&mut self) -> Option<usize> {
+        let current = self.patterns[self.current_pattern_idx].clone();
+        self.patterns.push(current);
+        let idx = self.patterns.len() - 1;
+        self.current_pattern_idx = idx;
+        Some(idx)
+    }
+
+    pub fn delete_pattern(&mut self) -> bool {
+        if self.patterns.len() <= 1 {
+            return false;
+        }
+        self.patterns.remove(self.current_pattern_idx);
+        if self.current_pattern_idx >= self.patterns.len() {
+            self.current_pattern_idx = self.patterns.len() - 1;
+        }
+        true
+    }
+
+    pub fn switch_pattern(&mut self, idx: usize) -> bool {
+        if idx < self.patterns.len() {
+            self.current_pattern_idx = idx;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn pattern_count(&self) -> usize {
+        self.patterns.len()
     }
 }
  // -1.0 (L) to 1.0 (R)
@@ -426,6 +526,7 @@ impl SequencerEngine {
             current_pattern_idx: 0,
             volume: 0.7,
             pan: 0.0,
+            automation: Vec::new(),
         });
     }
 
@@ -459,6 +560,7 @@ impl SequencerEngine {
                     current_pattern_idx: t.current_pattern_idx,
                     volume: t.volume,
                     pan: t.pan,
+                    automation: t.automation.clone(),
                 }
             }).collect(),
             playlist: self.playlist.clone(),
@@ -728,6 +830,7 @@ impl AudioGraph {
                 current_pattern_idx: 0,
                 volume: t.volume,
                 pan: t.panned,
+                automation: Vec::new(),
             };
             if let Some(poly) = track.node.as_any_mut().downcast_mut::<PolySynth>() {
                 poly.set_adsr(t.synth.adsr.into());

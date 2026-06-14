@@ -302,6 +302,7 @@ impl State {
                                 current_pattern_idx: 0,
                                 volume: 0.7,
                                 pan: 0.0,
+                                automation: Vec::new(),
                             });
                             ui.close_menu();
                         }
@@ -391,6 +392,7 @@ impl State {
                                 current_pattern_idx: 0,
                                 volume: 0.8,
                                 pan: 0.0,
+                                automation: Vec::new(),
                             });
                         }
                     });
@@ -684,6 +686,7 @@ impl State {
                                                         current_pattern_idx: 0,
                                                         volume: 0.8,
                                                         pan: 0.0,
+                                                        automation: Vec::new(),
                                                     });
                                                 }
                                                 
@@ -756,13 +759,39 @@ impl State {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("🎹 PIANO_ROLL").strong().color(egui::Color32::from_rgb(0, 200, 255)));
                                 ui.separator();
-                                ui.label(format!("Length: {} steps", self.pr_note_length));
+                                
+                                // Pattern selector
+                                if let Some(track_idx) = self.selected_track {
+                                    if let Some(track) = graph.engine.tracks.get_mut(track_idx) {
+                                        let current = track.current_pattern_idx;
+                                        let total = track.pattern_count();
+                                        
+                                        if ui.small_button("◀").clicked() && current > 0 {
+                                            track.switch_pattern(current - 1);
+                                        }
+                                        ui.label(egui::RichText::new(format!("P{} / {}", current + 1, total)).strong());
+                                        if ui.small_button("▶").clicked() && current + 1 < total {
+                                            track.switch_pattern(current + 1);
+                                        }
+                                        
+                                        if ui.small_button("+").on_hover_text("New pattern").clicked() {
+                                            track.add_pattern();
+                                        }
+                                        if ui.small_button("⊕").on_hover_text("Duplicate pattern").clicked() {
+                                            track.duplicate_pattern();
+                                        }
+                                        if ui.small_button("🗑").on_hover_text("Delete pattern").clicked() {
+                                            track.delete_pattern();
+                                        }
+                                    }
+                                }
+                                
                                 ui.separator();
-                                ui.label(egui::RichText::new("Alt+Wheel: Note Size | Ctrl+Wheel: V-Zoom | +Shift: H-Zoom").size(10.0).color(egui::Color32::GRAY));
+                                ui.label(format!("Len: {}", self.pr_note_length));
                                 ui.separator();
-                                ui.label(egui::RichText::new("Shift+Click: Select").size(10.0).color(egui::Color32::GRAY));
+                                ui.label(egui::RichText::new("Alt+Wheel: Size | Ctrl+Wheel: Zoom").size(10.0).color(egui::Color32::GRAY));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("🗑 Clear All").clicked() {
+                                    if ui.button("🗑 Clear").clicked() {
                                         if let Some(track_idx) = self.selected_track {
                                             if let Some(track) = graph.engine.tracks.get_mut(track_idx) {
                                                 track.current_pattern_mut().grid = [[0; 128]; 120];
@@ -860,6 +889,11 @@ impl State {
                                     (pitch_idx, x_idx)
                                 };
 
+                                // Raw float position for smooth note stretching
+                                let get_float_step = |pos: egui::Pos2| -> f32 {
+                                    (pos.x - grid_x_start) / zoom_x + self.pr_scroll.x
+                                };
+
                                 let in_bounds = |pitch: i32, step: i32| -> bool {
                                     pitch >= 0 && pitch < 120 && step >= 0 && step < 128
                                 };
@@ -944,8 +978,9 @@ impl State {
                                                             }
                                                         } else if self.pr_resize_mode {
                                                             if let Some((p, s)) = self.pr_last_clicked_note {
-                                                                let nl = (x_idx - s as i32 + 1).max(1).min(127) as u8;
-                                                                pattern.grid[p][s] = nl;
+                                                                let float_step = get_float_step(pos);
+                                                                let nl = (float_step - s as f32 + 1.0).max(0.5).min(128.0 - s as f32) as u8;
+                                                                pattern.grid[p][s] = nl.max(1);
                                                             }
                                                         }
                                                     }
@@ -1001,6 +1036,48 @@ impl State {
                                 // === DRAWING ===
                                 let painter = ui.painter_at(rect);
                                 
+                                // Background
+                                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(22, 22, 28));
+                                
+                                // Grid lines — subtle and clean
+                                let start_p = (self.pr_scroll.y) as i32;
+                                let end_p = (start_p + (grid_h / zoom_y) as i32 + 2).min(120);
+                                let start_s = (self.pr_scroll.x) as i32;
+                                let end_s = (start_s + (grid_w / zoom_x) as i32 + 2).min(128);
+                                
+                                // Horizontal lines (note rows)
+                                for p in (120 - end_p)..(120 - start_p) {
+                                    let riv = (119 - p as i32) as f32 - self.pr_scroll.y;
+                                    let y = rect.min.y + riv * zoom_y;
+                                    if y >= rect.min.y && y <= rect.max.y {
+                                        let is_c = p % 12 == 0;
+                                        let is_black = [1,3,6,8,10].contains(&(p % 12));
+                                        let alpha = if is_c { 80 } else if is_black { 20 } else { 35 };
+                                        let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+                                        painter.line_segment(
+                                            [egui::pos2(grid_x_start, y), egui::pos2(rect.max.x, y)],
+                                            egui::Stroke::new(0.5, color)
+                                        );
+                                    }
+                                }
+                                
+                                // Vertical lines (beat/step markers)
+                                for s in start_s..end_s {
+                                    let civ = s as f32 - self.pr_scroll.x;
+                                    let x = grid_x_start + civ * zoom_x;
+                                    if x >= grid_x_start && x <= rect.max.x {
+                                        let is_beat = s % 4 == 0;
+                                        let is_bar = s % 16 == 0;
+                                        let alpha = if is_bar { 100 } else if is_beat { 60 } else { 25 };
+                                        let width = if is_bar { 1.0 } else if is_beat { 0.7 } else { 0.4 };
+                                        let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+                                        painter.line_segment(
+                                            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                                            egui::Stroke::new(width, color)
+                                        );
+                                    }
+                                }
+                                
                                 // 1. Render Notes Overlay (Labels/Glow)
                                 if let Some(t_idx) = self.selected_track {
                                     if let Some(track) = graph.engine.tracks.get(t_idx) {
@@ -1023,37 +1100,62 @@ impl State {
                                                     let nr = egui::Rect::from_min_size(
                                                         egui::pos2(grid_x_start + civ * zoom_x, ys),
                                                         egui::vec2(len as f32 * zoom_x, zoom_y)
-                                                    ).shrink(1.0);
+                                                    ).shrink(0.5);
                                                     
                                                     let is_sel = self.pr_selected_notes.contains(&(p_idx, s_idx));
+                                                    let is_black_key = [1,3,6,8,10].contains(&(p_idx % 12));
                                                     
-                                                    // Beautiful gradients and strokes for commercial feel
-                                                    let fill_color = if is_sel { egui::Color32::from_rgb(30, 200, 200) } else { egui::Color32::from_rgb(30, 120, 255) };
-                                                    let stroke_color = if is_sel { egui::Color32::WHITE } else { egui::Color32::WHITE.gamma_multiply(0.4) };
+                                                    // Color palette — FL Studio inspired
+                                                    let fill_color = if is_sel {
+                                                        egui::Color32::from_rgb(0, 220, 200)
+                                                    } else if is_black_key {
+                                                        egui::Color32::from_rgb(25, 95, 210)
+                                                    } else {
+                                                        egui::Color32::from_rgb(45, 130, 255)
+                                                    };
                                                     
-                                                    painter.rect_filled(nr, 3.0, fill_color);
-                                                    painter.rect_stroke(nr, 3.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Inside);
-                                                    painter.rect_stroke(nr, 3.0, egui::Stroke::new(1.0, egui::Color32::BLACK.gamma_multiply(0.6)), egui::StrokeKind::Outside);
+                                                    let stroke_color = if is_sel { 
+                                                        egui::Color32::WHITE 
+                                                    } else { 
+                                                        egui::Color32::from_rgb(20, 70, 180) 
+                                                    };
                                                     
-                                                    // Drag handle marker on the right edge (Interactive indicator)
-                                                    if nr.width() > 10.0 {
+                                                    // Shadow
+                                                    let shadow = nr.translate(egui::vec2(1.0, 1.5));
+                                                    painter.rect_filled(shadow, 2.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 50));
+                                                    
+                                                    // Main note body
+                                                    painter.rect_filled(nr, 2.0, fill_color);
+                                                    
+                                                    // Top highlight gradient (fake)
+                                                    let highlight = egui::Rect::from_min_max(
+                                                        nr.min,
+                                                        egui::pos2(nr.max.x, nr.min.y + (nr.height() * 0.35).max(1.0))
+                                                    );
+                                                    painter.rect_filled(highlight, 2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25));
+                                                    
+                                                    // Border
+                                                    painter.rect_stroke(nr, 2.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Inside);
+                                                    
+                                                    // Drag handle — subtle vertical bar on right edge
+                                                    if nr.width() > 12.0 {
                                                         let handle_rect = egui::Rect::from_min_max(
-                                                            egui::pos2(nr.max.x - 5.0, nr.min.y + 4.0),
-                                                            egui::pos2(nr.max.x - 2.0, nr.max.y - 4.0),
+                                                            egui::pos2(nr.max.x - 4.0, nr.min.y + 3.0),
+                                                            egui::pos2(nr.max.x - 1.5, nr.max.y - 3.0),
                                                         );
-                                                        painter.rect_filled(handle_rect, 1.0, egui::Color32::WHITE.gamma_multiply(0.5));
+                                                        painter.rect_filled(handle_rect, 1.0, egui::Color32::WHITE.gamma_multiply(0.45));
                                                     }
                                                     
-                                                    // Centered, readable note name
-                                                    if nr.width() > 25.0 {
+                                                    // Note name
+                                                    if nr.width() > 28.0 {
                                                         let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
                                                         let name = format!("{}{}", names[p_idx % 12], p_idx / 12 - 1);
                                                         painter.text(
-                                                            egui::pos2(nr.min.x + 6.0, nr.center().y),
+                                                            egui::pos2(nr.min.x + 5.0, nr.center().y),
                                                             egui::Align2::LEFT_CENTER,
                                                             name, 
-                                                            egui::FontId::proportional(11.0), 
-                                                            egui::Color32::WHITE.gamma_multiply(0.9)
+                                                            egui::FontId::proportional(10.0), 
+                                                            egui::Color32::WHITE.gamma_multiply(0.95)
                                                         );
                                                     }
                                                 }

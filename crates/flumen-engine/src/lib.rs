@@ -1,4 +1,5 @@
 pub mod graph;
+pub mod plugin_manager;
 
 pub mod engine {
     use crate::graph::{AudioGraph, ProcessContext, PolySynth, Waveform};
@@ -16,27 +17,11 @@ pub mod engine {
         pub fn new() -> Self {
             let mut graph = AudioGraph::new();
 
-            // Track 1: Bass (Saw)
+            // Track 1: Bass (Saw) — empty pattern
             graph.engine.add_track(Box::new(PolySynth::new(Waveform::Saw)));
-            {
-                let pattern = graph.engine.tracks[0].current_pattern_mut();
-                // A simple melodic bassline
-                pattern.grid[36 - 12][0] = 16;  // C2, length 16 steps
-                pattern.grid[36 - 12][4] = 4;   // C2
-                pattern.grid[43 - 12][8] = 4;   // G2
-                pattern.grid[48 - 12][12] = 4;  // C3
-            }
 
-            // Track 2: Lead (Square)
+            // Track 2: Lead (Square) — empty pattern
             graph.engine.add_track(Box::new(PolySynth::new(Waveform::Square)));
-            {
-                let pattern = graph.engine.tracks[1].current_pattern_mut();
-                // A simple melody
-                pattern.grid[48 - 12][2] = 4;   // C3
-                pattern.grid[50 - 12][6] = 4;   // D3
-                pattern.grid[52 - 12][10] = 4;  // E3
-                pattern.grid[53 - 12][14] = 4;  // F3
-            }
             graph.engine.tracks[1].pan = 0.5;
 
             Self {

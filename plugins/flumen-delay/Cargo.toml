@@ -1,0 +1,11 @@
+[package]
+name = "flumen-delay"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+flumen-common = { path = "../../crates/flumen-common" }
+flumen-engine = { path = "../../crates/flumen-engine" }

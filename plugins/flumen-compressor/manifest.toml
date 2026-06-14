@@ -1,0 +1,49 @@
+[info]
+id = "flumen-compressor"
+name = "Flumen Compressor"
+version = "0.1.0"
+author = "NLPA Collab"
+description = "Simple dynamics compressor"
+plugin_type = "Effect"
+
+[[params]]
+name = "threshold"
+label = "Threshold"
+min = -60.0
+max = 0.0
+default = -20.0
+value = -20.0
+
+[[params]]
+name = "ratio"
+label = "Ratio"
+min = 1.0
+max = 20.0
+default = 4.0
+value = 4.0
+
+[[params]]
+name = "attack"
+label = "Attack"
+min = 0.1
+max = 100.0
+default = 10.0
+value = 10.0
+
+[[params]]
+name = "release"
+label = "Release"
+min = 10.0
+max = 1000.0
+default = 100.0
+value = 100.0
+
+[[params]]
+name = "makeup"
+label = "Makeup"
+min = 0.0
+max = 24.0
+default = 0.0
+value = 0.0
+
+library = "flumen_compressor"

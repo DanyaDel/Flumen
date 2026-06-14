@@ -1,0 +1,33 @@
+[info]
+id = "flumen-eq"
+name = "Flumen EQ"
+version = "0.1.0"
+author = "NLPA Collab"
+description = "Simple 3-band equalizer"
+plugin_type = "Effect"
+
+[[params]]
+name = "low"
+label = "Low"
+min = -12.0
+max = 12.0
+default = 0.0
+value = 0.0
+
+[[params]]
+name = "mid"
+label = "Mid"
+min = -12.0
+max = 12.0
+default = 0.0
+value = 0.0
+
+[[params]]
+name = "high"
+label = "High"
+min = -12.0
+max = 12.0
+default = 0.0
+value = 0.0
+
+library = "flumen_eq"

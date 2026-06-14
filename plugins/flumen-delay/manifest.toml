@@ -1,0 +1,33 @@
+[info]
+id = "flumen-delay"
+name = "Flumen Delay"
+version = "0.1.0"
+author = "NLPA Collab"
+description = "Simple stereo delay effect"
+plugin_type = "Effect"
+
+[[params]]
+name = "time"
+label = "Time"
+min = 0.01
+max = 2.0
+default = 0.3
+value = 0.3
+
+[[params]]
+name = "feedback"
+label = "Feedback"
+min = 0.0
+max = 0.95
+default = 0.4
+value = 0.4
+
+[[params]]
+name = "mix"
+label = "Mix"
+min = 0.0
+max = 1.0
+default = 0.5
+value = 0.5
+
+library = "flumen_delay"

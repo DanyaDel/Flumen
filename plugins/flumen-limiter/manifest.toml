@@ -1,0 +1,25 @@
+[info]
+id = "flumen-limiter"
+name = "Flumen Limiter"
+version = "0.1.0"
+author = "NLPA Collab"
+description = "Simple peak limiter"
+plugin_type = "Effect"
+
+[[params]]
+name = "ceiling"
+label = "Ceiling"
+min = -12.0
+max = 0.0
+default = -0.3
+value = -0.3
+
+[[params]]
+name = "release"
+label = "Release"
+min = 1.0
+max = 100.0
+default = 10.0
+value = 10.0
+
+library = "flumen_limiter"
